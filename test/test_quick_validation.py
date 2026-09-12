@@ -52,35 +52,36 @@ def test_basic_functionality():
     total_tests += 1
     print("\n3️⃣ Testing agent initialization...")
     try:
-        # Create a simple config object for the agent
-        class SimpleConfig:
-            def __init__(self):
-                self.enable_debug = False
-                
-        config = SimpleConfig()
-        sentiment_agent = auto_trade.SentimentAnalysisAgent(config)
-        print("✅ SentimentAnalysisAgent created successfully")
+        # The legacy SentimentAnalysisAgent was deleted along with its
+        # generated-post source; the real text channel is TextSentimentAgent.
+        assert hasattr(auto_trade, 'TextSentimentAgent'), "TextSentimentAgent missing"
+        assert not hasattr(auto_trade, 'SentimentAnalysisAgent'), \
+            "legacy SentimentAnalysisAgent is back"
+        scorer = None
+        from signals.text_sentiment import get_scorer
+        scorer = get_scorer("vader")
+        print(f"✅ text sentiment scorer created successfully ({scorer.name})")
         tests_passed += 1
     except Exception as e:
         print(f"❌ Agent initialization failed: {e}")
-        sentiment_agent = None
-    
-    # Test 4: Sentiment analysis
+
+    # Test 4: Sentiment scoring
     total_tests += 1
     print("\n4️⃣ Testing sentiment analysis...")
     try:
-        if sentiment_agent is not None:
-            test_posts = [
-                {'text': 'Great market outlook today! 🚀', 'username': 'test_user', 'timestamp': datetime.now()},
-                {'text': 'Market looks bearish today', 'username': 'test_user2', 'timestamp': datetime.now()}
-            ]
-            result = sentiment_agent.analyze_sentiment(test_posts)
-            assert 'sentiment_score' in result
-            assert 'confidence' in result
-            print(f"✅ Sentiment analysis working (score: {result['sentiment_score']:.3f})")
+        if scorer is not None:
+            scores = scorer.score([
+                'Great market outlook today, bitcoin to the moon! 🚀',
+                'Market looks bearish today, everyone got rekt',
+            ])
+            assert len(scores) == 2
+            assert scores[0] > 0.0, f"expected positive, got {scores[0]}"
+            assert scores[1] < 0.0, f"expected negative, got {scores[1]}"
+            print(f"✅ Sentiment analysis working "
+                  f"(scores: {scores[0]:+.3f}, {scores[1]:+.3f})")
             tests_passed += 1
         else:
-            print("⚠️  Skipping sentiment test due to agent initialization failure")
+            print("⚠️  Skipping sentiment test due to scorer initialization failure")
     except Exception as e:
         print(f"❌ Sentiment analysis failed: {e}")
     

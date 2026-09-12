@@ -66,7 +66,10 @@ class TestTradingSystemCore(unittest.TestCase):
             
             # Test key classes exist
             self.assertTrue(hasattr(auto_trade, 'TradingDecisionAgent'))
-            self.assertTrue(hasattr(auto_trade, 'SentimentAnalysisAgent'))
+            # The legacy SentimentAnalysisAgent (generated posts attributed to
+            # real people) was deleted; TextSentimentAgent is its replacement.
+            self.assertTrue(hasattr(auto_trade, 'TextSentimentAgent'))
+            self.assertFalse(hasattr(auto_trade, 'SentimentAnalysisAgent'))
             self.assertTrue(hasattr(auto_trade, 'fetch_binance_ta'))
             self.assertTrue(hasattr(auto_trade, 'display_simulation_results'))
             
@@ -133,27 +136,23 @@ class TestTradingSystemCore(unittest.TestCase):
             auto_trade = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(auto_trade)
             
-            # Test sentiment agent (local, should always work)
-            # Create a simple config object for the agent
-            class SimpleConfig:
-                def __init__(self):
-                    self.enable_debug = False
-                    
-            config = SimpleConfig()
-            sentiment_agent = auto_trade.SentimentAnalysisAgent(config)
-            self.assertIsNotNone(sentiment_agent)
-            print("✅ SentimentAnalysisAgent initialized")
-            
-            # Test basic sentiment analysis
-            test_posts = [
-                {'text': 'Great market outlook today!', 'username': 'test_user', 'timestamp': datetime.now()},
-                {'text': 'Market is crashing badly', 'username': 'test_user2', 'timestamp': datetime.now()}
-            ]
-            
-            sentiment_result = sentiment_agent.analyze_sentiment(test_posts)
-            self.assertIsInstance(sentiment_result, dict)
-            self.assertIn('sentiment_score', sentiment_result)
-            print("✅ Sentiment analysis working")
+            # Text sentiment scorer (local, no network, should always work).
+            from signals.text_sentiment import get_scorer
+
+            scorer = get_scorer("vader")
+            self.assertIsNotNone(scorer)
+            print(f"✅ text sentiment scorer initialized ({scorer.name})")
+
+            scores = scorer.score([
+                "Great market outlook today, bitcoin looking strong!",
+                "Market is crashing badly, everyone got rekt",
+            ])
+            self.assertEqual(len(scores), 2)
+            # Direction is the contract worth asserting: the first text is
+            # positive, the second negative. Exact magnitudes are VADER's.
+            self.assertGreater(scores[0], 0.0)
+            self.assertLess(scores[1], 0.0)
+            print(f"✅ text sentiment scoring working ({scores[0]:+.3f}, {scores[1]:+.3f})")
             
         except Exception as e:
             self.fail(f"Agent initialization failed: {str(e)}")

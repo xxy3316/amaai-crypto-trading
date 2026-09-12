@@ -7,67 +7,158 @@ import datetime as dt
 import json
 import logging
 import os
-import re
+import sys
 import time
+import warnings
 from datetime import datetime
-from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Union
-from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Any, Union
 
 # ── THIRD-PARTY IMPORTS ─────────────────────────────────────────────────────
-import ccxt
+# Technical-indicator (ta.*) and LLM-construction (ChatOpenAI/AzureChatOpenAI)
+# imports moved to core/data.py and core/llm.py respectively; ccxt, requests
+# and BeautifulSoup went with them and with the deleted social-post agent.
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-import plotly.subplots as sp
 import psycopg2
-import requests
 import streamlit as st
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
-from urllib.parse import urljoin
-
-# ── TRADING & TECHNICAL ANALYSIS IMPORTS ────────────────────────────────────
-from ta.trend import SMAIndicator, MACD
-from ta.volatility import BollingerBands
-from ta.momentum import RSIIndicator
+from pydantic import Field
 
 # ── LANGCHAIN IMPORTS ───────────────────────────────────────────────────────
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import Tool, BaseTool
-from langchain_core.agents import AgentAction, AgentFinish
-from langchain_core.callbacks import BaseCallbackHandler
 from langchain.agents import AgentExecutor, create_openai_tools_agent
-from langchain_community.vectorstores import PGVector
-from langchain_openai import OpenAIEmbeddings
-from langchain_core.pydantic_v1 import BaseModel as PydanticBaseModel, Field
+from langchain_openai import OpenAIEmbeddings, AzureOpenAIEmbeddings
+# NOTE: langchain_core.pydantic_v1 used to be imported here and shadowed the
+# pydantic v2 `Field` imported above. LangChain 0.3 is pydantic v2 native, so
+# the v1 shim is both deprecated and actively harmful. Removed deliberately.
 
 # ── CONDITIONAL IMPORTS (with error handling) ──────────────────────────────
 # Setup logging early
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Sentiment analysis
+# Streamlit's auto-reload watcher walks every entry in sys.modules and reads
+# each one's __path__ to decide which files to watch. `transformers` -- pulled
+# in by langchain.agents and langchain_openai, not by anything here -- resolves
+# its submodules lazily, so merely READING that attribute executes a real
+# import of every transformers.models.* image processor. Dozens of those import
+# torchvision, which is not installed, and each failure prints a full traceback
+# before the watcher shrugs and moves on. Hundreds of lines of alarming output,
+# no consequence: the app is already running by then, which is why the UI loads
+# fine.
+#
+# Silencing this specific logger loses nothing. Streamlit blacklists
+# `**/site-packages` and `**/venv` from watching anyway, so every path those
+# failed imports were being asked for would have been discarded a moment later
+# -- the blacklist is applied to the RESULT of the probe, too late to prevent
+# it. Only this one logger is touched; genuine Streamlit warnings elsewhere are
+# untouched.
+logging.getLogger("streamlit.watcher.local_sources_watcher").setLevel(logging.ERROR)
+
+# `streamlit run auto-trade.py` puts this directory on sys.path, but running the
+# file by absolute path from elsewhere does not, and then `import signals`
+# fails and the positioning channel goes quietly dead. Make the repo root
+# importable regardless of how the file was launched.
+_REPO_ROOT = str(Path(__file__).resolve().parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+# ── LOG NOISE CONTROL ──────────────────────────────────────────────────────
+# Three requests were logged per decision, which buried the two lines that
+# actually matter (the LLM contribution report and the positioning report).
+for _noisy in ("httpx", "httpcore", "openai._base_client", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# LangChain's structured-output path hands pydantic a parsed model where the
+# schema declares `parsed: None`, so pydantic emits a serializer warning on
+# EVERY successful call. The parse itself succeeds; the authoritative signal
+# for genuine failures is `llm_failures` in the run's llm_report, which is
+# incremented from the real exception handler in make_decision. Suppressed
+# narrowly by message and module so unrelated pydantic warnings still surface.
+warnings.filterwarnings(
+    "ignore", message="Pydantic serializer warnings",
+    category=UserWarning, module=r"pydantic\.main",
+)
+
+# Exogenous positioning signal (Binance futures metrics; free, keyless, cached)
 try:
-    from textblob import TextBlob
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    SENTIMENT_AVAILABLE = True
+    from signals.binance_positioning import (
+        PositioningReading, PositioningSignalAgent, ensure_cached, missing_days,
+        warmup_start_date,
+    )
+    POSITIONING_AVAILABLE = True
 except ImportError as e:
-    logger.warning(f"Sentiment analysis libraries not available: {e}")
-    SENTIMENT_AVAILABLE = False
-    class TextBlob:
-        def __init__(self, text): self.sentiment = type('obj', (object,), {'polarity': 0.0, 'subjectivity': 0.0})
-    class SentimentIntensityAnalyzer:
-        def polarity_scores(self, text): return {'compound': 0.0, 'pos': 0.0, 'neu': 0.0, 'neg': 0.0}
+    logger.warning(f"Positioning signal module not available: {e}")
+    POSITIONING_AVAILABLE = False
+    PositioningReading = None
+    PositioningSignalAgent = None
+    ensure_cached = None
+    missing_days = None
+    warmup_start_date = None
+
+# Exogenous text sentiment (Hacker News via Algolia; free, keyless, cached)
+try:
+    from signals.text_sentiment import (
+        DEFAULT_QUERIES as TEXT_DEFAULT_QUERIES,
+        POINT_THRESHOLDS as TEXT_POINT_THRESHOLDS,
+        TextSentimentAgent,
+        TextSentimentReading,
+        Z_CLIP as TEXT_Z_CLIP,
+        ensure_cached as ensure_text_cached,
+        missing_days as text_missing_days,
+        warmup_start_date as text_warmup_start_date,
+    )
+    TEXT_SENTIMENT_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Text sentiment module not available: {e}")
+    TEXT_SENTIMENT_AVAILABLE = False
+    TextSentimentAgent = None
+    TextSentimentReading = None
+    ensure_text_cached = None
+    text_missing_days = None
+    text_warmup_start_date = None
+    TEXT_DEFAULT_QUERIES = ("bitcoin", "crypto")
+    TEXT_POINT_THRESHOLDS = ((0.66, 2), (0.33, 1))
+    TEXT_Z_CLIP = 3.0
+
+# ── CORPORATE TLS TRUST ────────────────────────────────────────────────────
+# This network re-signs HTTPS with a private root CA that Windows trusts but
+# certifi does not, so any library verifying against certifi alone fails with
+# CERTIFICATE_VERIFY_FAILED. That was silently killing the vector-DB agent:
+# `tiktoken` downloads its BPE encoding from openaipublic.blob.core.windows.net
+# on first use, the download failed, and every store_pattern call errored out.
+# Same class of bug as the decorative sentiment agent -- an agent that runs,
+# fails, and contributes nothing.
+#
+# The generated bundle is certifi's roots PLUS the Windows trust store, i.e. a
+# strict superset of the default, so anything that verified before still
+# verifies (checked against ccxt price fetches and the Azure client). An
+# existing REQUESTS_CA_BUNDLE is never overridden.
+#
+# verify=False is deliberately NOT used anywhere: disabling verification would
+# make the data-provenance claim in any write-up unverifiable.
+def _configure_corporate_tls() -> None:
+    if os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("DISABLE_CORPORATE_CA"):
+        return
+    try:
+        from signals.corporate_ca import ensure_bundle
+        bundle = ensure_bundle()
+    except Exception as e:  # never let trust-store setup break startup
+        logger.debug(f"Corporate CA bundle unavailable: {e}")
+        return
+    if bundle and Path(bundle).exists():
+        os.environ["REQUESTS_CA_BUNDLE"] = str(bundle)
+        logger.info(f"Using merged CA bundle for HTTPS verification: {bundle}")
+
+
+_configure_corporate_tls()
 
 # SQLAlchemy
 try:
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import create_engine
     from sqlalchemy.engine import Engine
     SQLALCHEMY_AVAILABLE = True
 except ImportError:
@@ -95,7 +186,10 @@ except ImportError as e:
 
 # Vector DB
 try:
-    import faiss
+    # faiss itself is unused here: it is imported so that a missing native
+    # wheel is detected now and sets VECTOR_DB_AVAILABLE=False, rather than
+    # blowing up later inside FAISS. Do not "clean up" this import.
+    import faiss  # noqa: F401
     from langchain_community.vectorstores import FAISS
     from langchain_core.documents import Document
     VECTOR_DB_AVAILABLE = True
@@ -111,467 +205,100 @@ except ImportError as e:
 # Load environment variables
 load_dotenv()
 
+# ── STREAMLIT PAGE CONFIG ───────────────────────────────────────────────────
+# MUST be the first Streamlit command executed by the script. Keeping it here,
+# at module scope, guarantees it runs before any st.* call that a later import
+# or startup check might emit (e.g. a warning banner).
+st.set_page_config(
+    page_title="AMAAI Multi-Agent Trading System",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
 # ── CONFIGURATION & MODELS ──────────────────────────────────────────────────
-class TradingAction(Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-    HOLD = "HOLD"
+# ── DOMAIN TYPES ───────────────────────────────────────────────────────────
+# Moved to core/config.py.
+from core.config import (  # noqa: E402
+    TradingAction,
+    TradingConfig,
+    TradingDecision,
+)
 
-@dataclass
-class MarketData:
-    timestamp: datetime
-    price: float
-    volume: float
-    ma20: float
-    upper_bb: float
-    lower_bb: float
-    rsi: float
-    macd_hist: float
-    
-@dataclass
-class TradingDecision:
-    action: TradingAction
-    confidence: float
-    reasoning: str
-    price: float
-    timestamp: datetime
+# ── LLM PROVIDER + DECISION CONTRACT ───────────────────────────────────────
+# Moved to core/llm.py.
+from core.llm import (  # noqa: E402
+    AZURE_OPENAI_API_KEY,
+    AZURE_OPENAI_API_VERSION,
+    AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+    AZURE_OPENAI_ENDPOINT,
+    USE_AZURE_OPENAI,
+    LLMContribution,
+    LLMRiskAssessment,
+    LLMTradeAdjustment,
+    describe_active_model,
+    get_llm,
+    get_llm_provider_status,
+    set_error_reporter,
+)
 
-class TradingConfig(BaseModel):
-    initial_capital: float = 1000.0
-    rsi_oversold: float = 30.0
-    rsi_overbought: float = 70.0
-    max_position_size: float = 1.0
-    stop_loss_pct: float = 0.05
-    take_profit_pct: float = 0.10
-    buy_fee_pct: float = 0.10  # 10% fee on buy
-    sell_fee_pct: float = 0.0  # No fee on sell (can sell full amount)
-    enable_deep_learning: bool = True
-    enable_vector_db: bool = True
-    show_reasoning: bool = True
-    target_win_rate: float = 0.75  # Target 75% win rate (more realistic for active strategy)
-    min_confidence: float = 0.65  # Minimum confidence for trades (active strategy)
-    simulation_step: int = 6  # How often to make decisions (in intervals)
-    
-    # Trading Strategy Configurations
-    trading_mode: str = "moderate"  # conservative, moderate, aggressive
-    position_size_pct: float = 50.0  # Percentage of capital to use per trade
-    signal_threshold: int = 1  # Minimum signal strength for trades
-    
-    @classmethod
-    def get_conservative_config(cls, initial_capital: float = 1000.0):
-        return cls(
-            initial_capital=initial_capital,
-            rsi_oversold=25.0,
-            rsi_overbought=75.0,
-            max_position_size=0.3,  # Use max 30% of capital per trade
-            stop_loss_pct=0.03,     # 3% stop loss
-            take_profit_pct=0.06,   # 6% take profit
-            min_confidence=0.80,    # High confidence required
-            signal_threshold=3,     # Need strong signals
-            position_size_pct=25.0, # Use 25% of capital per trade
-            trading_mode="conservative"
-        )
-    
-    @classmethod
-    def get_moderate_config(cls, initial_capital: float = 1000.0):
-        return cls(
-            initial_capital=initial_capital,
-            rsi_oversold=30.0,
-            rsi_overbought=70.0,
-            max_position_size=0.6,  # Use max 60% of capital per trade
-            stop_loss_pct=0.05,     # 5% stop loss
-            take_profit_pct=0.10,   # 10% take profit
-            min_confidence=0.65,    # Moderate confidence required
-            signal_threshold=2,     # Need moderate signals
-            position_size_pct=50.0, # Use 50% of capital per trade
-            trading_mode="moderate"
-        )
-    
-    @classmethod
-    def get_aggressive_config(cls, initial_capital: float = 1000.0):
-        return cls(
-            initial_capital=initial_capital,
-            rsi_oversold=35.0,
-            rsi_overbought=65.0,
-            max_position_size=0.9,  # Use max 90% of capital per trade
-            stop_loss_pct=0.08,     # 8% stop loss (wider for volatility)
-            take_profit_pct=0.15,   # 15% take profit
-            min_confidence=0.55,    # Lower confidence required
-            signal_threshold=1,     # Need minimal signals
-            position_size_pct=75.0, # Use 75% of capital per trade
-            trading_mode="aggressive"
-        )
+# `core` deliberately does not import Streamlit, so provider errors reach the
+# user through this hook instead of a direct st.error call. Without it a
+# missing API key would only appear in the terminal log, which is where the
+# person running the app is least likely to look.
+set_error_reporter(st.error)
 
-# ── SECURE LLM SETUP ────────────────────────────────────────────────────────
-def get_llm() -> ChatOpenAI:
-    """Initialize LLM with secure configuration"""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        error_msg = """
-        OPENAI_API_KEY environment variable not set!
-        
-        Please follow these steps:
-        1. Copy .env.template to .env
-        2. Add your OpenAI API key to the .env file
-        3. Restart the application
-        
-        Get your API key from: https://platform.openai.com/api-keys
-        """
-        st.error(error_msg)
-        raise ValueError("OPENAI_API_KEY environment variable not set")
-    
-    if not api_key.startswith('sk-'):
-        error_msg = "Invalid OpenAI API key format. API keys should start with 'sk-'"
-        st.error(error_msg)
-        raise ValueError("Invalid OpenAI API key format")
-    
-    try:
-        return ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0.3,
-            openai_api_key=api_key,
-            max_retries=3,
-            request_timeout=30
-        )
-    except Exception as e:
-        error_msg = f"Failed to initialize OpenAI client: {str(e)}"
-        st.error(error_msg)
-        raise
+# ── CONFIGURATION ──────────────────────────────────────────────────────────
+# Every runtime flag and domain type now lives in core/config.py, which had
+# been scattered across this file at lines 341, 531, 623, 630, 1193, 1194 and
+# 3308, each with its own ad-hoc parsing.
+from core.config import (  # noqa: E402
+    ALLOW_SYNTHETIC_DATA,
+    ENABLE_DATABASE,
+    EXECUTION_MODE,
+    LLM_MAX_ADJUSTMENT,
+    POSITIONING_AUTO_FETCH,
+    POSITIONING_LAG_BARS,
+    POSITIONING_MAX_POINTS,
+    POSITIONING_ZSCORE_WINDOW,
+    positioning_zscore_window,
+    DECISION_CADENCE_HOURS,
+    decision_step_bars,
+    interval_hours,
+    SLIPPAGE_PCT,
+    TEXT_SENTIMENT_AUTO_FETCH,
+    TEXT_SENTIMENT_LAG_BARS,
+    TEXT_SENTIMENT_MAX_POINTS,
+    TEXT_SENTIMENT_MIN_DOCS,
+    TEXT_SENTIMENT_QUERIES,
+    TEXT_SENTIMENT_SCORER,
+    TEXT_SENTIMENT_WINDOW_HOURS,
+    TEXT_SENTIMENT_ZSCORE_WINDOW,
+    USE_LLM_DECISIONS,
+    USE_POSITIONING_SIGNAL,
+    USE_TEXT_SENTIMENT,
+    INDICATOR_WARMUP_BARS,
+    InsufficientHistory,
+    SyntheticDataBlocked,
+)
 
-# ── DATA HANDLING FUNCTIONS ─────────────────────────────────────────────────
-def fetch_binance_ta(symbol, timeframe, start, end, original_start=None, original_end=None):
-    """Fetch OHLCV data from Binance and calculate technical indicators with robust error handling"""
-    try:
-        # Store original user-requested date range on first call
-        if original_start is None:
-            original_start = start
-        if original_end is None:
-            original_end = end
-        
-        # Try multiple approaches to get data
-        data_sources = [
-            {'name': 'Binance API', 'function': _fetch_from_binance},
-            {'name': 'Simulated Data', 'function': _generate_simulated_data}
-        ]
-        
-        for source in data_sources:
-            try:
-                logger.info(f"Attempting to fetch data using {source['name']}...")
-                df = source['function'](symbol, timeframe, start, end, original_start, original_end)
-                if df is not None and not df.empty:
-                    logger.info(f"Successfully fetched data using {source['name']}: {len(df)} rows")
-                    return df
-            except Exception as source_error:
-                logger.warning(f"{source['name']} failed: {source_error}")
-                continue
-        
-        # If all sources fail, raise error
-        raise ValueError(f"All data sources failed for {symbol}. Unable to fetch or generate data.")
-        
-    except Exception as e:
-        logger.error(f"Error in fetch_binance_ta: {e}")
-        raise
+# ── DATA HANDLING ──────────────────────────────────────────────────────────
+# Moved to core/data.py. Its private helpers (_fetch_from_binance,
+# _generate_simulated_data, _process_technical_indicators) are reached through
+# fetch_binance_ta and are no longer re-exported here.
+from core.data import (  # noqa: E402
+    fetch_binance_ta,
+    resolve_bar_index,
+)
 
-def _fetch_from_binance(symbol, timeframe, start, end, original_start, original_end):
-    """Attempt to fetch real data from Binance"""
-    try:
-        ex = ccxt.binance()
-        since = ex.parse8601(start.isoformat())
-        end_ts = ex.parse8601(end.isoformat())
-        
-        # Validate date range
-        if since >= end_ts:
-            raise ValueError("Start date must be before end date")
-        
-        rows = []
-        logger.info(f"Fetching data for {symbol} from {start} to {end} (original request: {original_start} to {original_end})")
-        
-        # Calculate expected data points based on timeframe and date range
-        timeframe_minutes = ex.parse_timeframe(timeframe) / 60  # Convert to minutes
-        date_range_days = (end - start).total_seconds() / (24 * 3600)  # Convert to days
-        expected_points = int((date_range_days * 24 * 60) / timeframe_minutes)
-        
-        logger.info(f"Expected data points for {timeframe} over {date_range_days:.1f} days: ~{expected_points}")
-        
-        # Use appropriate batch size (max 1000 for CCXT)
-        batch_size = min(1000, expected_points + 100)  # Add buffer for safety
-        
-        while since < end_ts:
-            try:
-                batch = ex.fetch_ohlcv(symbol, timeframe, since=since, limit=batch_size)
-                if not batch:
-                    break
-                rows += batch
-                since = batch[-1][0] + ex.parse_timeframe(timeframe) * 1000
-                
-                # Add small delay to avoid rate limiting
-                time.sleep(0.1)
-                
-                # Break if we have enough data to avoid over-fetching
-                if len(rows) >= expected_points * 1.5:  # 50% buffer
-                    logger.info(f"Fetched sufficient data: {len(rows)} points")
-                    break
-                
-            except Exception as api_error:
-                logger.error(f"API error fetching batch: {api_error}")
-                break
-        
-        if not rows:
-            raise ValueError(f"No data returned for {symbol} from Binance API.")
-        
-        df = pd.DataFrame(rows, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
-        df['ts'] = pd.to_datetime(df.ts, unit='ms')
-        df.set_index('ts', inplace=True)
-        
-        # Remove any duplicate timestamps
-        df = df[~df.index.duplicated(keep='first')]
-        
-        # Ensure numeric data types
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Remove rows with NaN prices (critical data)
-        df = df.dropna(subset=['close'])
-        
-        return _process_technical_indicators(df, original_start, original_end)
-        
-    except Exception as e:
-        logger.error(f"Binance API error: {e}")
-        raise
+# ── POSTGRES CONNECTION (OPTIONAL) ──────────────────────────────────────────
+# Result persistence is OFF by default: the app runs fully without PostgreSQL
+# and keeps past runs in the Streamlit session instead. To turn persistence
+# back on, set ENABLE_DATABASE=true in .env and point DB_* at a live server.
+# ENABLE_DATABASE itself is imported from core.config above; it used to be
+# re-parsed here as well, which left the import dead and gave two names for
+# one flag.
 
-def _generate_simulated_data(symbol, timeframe, start, end, original_start, original_end):
-    """Generate simulated market data for testing when real data is unavailable"""
-    try:
-        logger.info(f"Generating simulated data for {symbol} from {start} to {end}")
-        
-        # Determine timeframe in minutes
-        timeframe_minutes = 1
-        if timeframe == '5m':
-            timeframe_minutes = 5
-        elif timeframe == '15m':
-            timeframe_minutes = 15
-        elif timeframe == '1h':
-            timeframe_minutes = 60
-        elif timeframe == '4h':
-            timeframe_minutes = 240
-        elif timeframe == '1d':
-            timeframe_minutes = 1440
-        
-        # Create time series
-        time_range = pd.date_range(start=start, end=end, freq=f'{timeframe_minutes}min')
-        
-        if len(time_range) < 10:
-            # Ensure we have at least 10 data points
-            time_range = pd.date_range(start=start, periods=100, freq=f'{timeframe_minutes}min')
-        
-        # Generate realistic price data
-        np.random.seed(42)  # For reproducible results
-        
-        # Starting price based on symbol
-        if 'BTC' in symbol.upper():
-            base_price = 45000  # Bitcoin around $45k
-        elif 'ETH' in symbol.upper():
-            base_price = 2500   # Ethereum around $2.5k
-        else:
-            base_price = 100    # Generic price
-        
-        # Generate random walk with trend and volatility
-        n_points = len(time_range)
-        returns = np.random.normal(0.0001, 0.02, n_points)  # Small positive drift with volatility
-        
-        # Add some market structure (trend changes)
-        for i in range(0, n_points, max(1, n_points // 10)):
-            trend_change = np.random.choice([-1, 1]) * np.random.uniform(0.001, 0.005)
-            end_idx = min(i + n_points // 10, n_points)
-            returns[i:end_idx] += trend_change
-        
-        # Calculate prices
-        log_prices = np.log(base_price) + np.cumsum(returns)
-        prices = np.exp(log_prices)
-        
-        # Generate OHLCV data
-        data = []
-        for i, (timestamp, close) in enumerate(zip(time_range, prices)):
-            # Generate realistic OHLC from close price
-            volatility = abs(returns[i]) * close
-            
-            high = close + np.random.uniform(0, volatility * 2)
-            low = close - np.random.uniform(0, volatility * 2)
-            
-            # Ensure logical OHLC relationships
-            high = max(high, close)
-            low = min(low, close)
-            
-            # Generate open price close to previous close
-            if i == 0:
-                open_price = close * np.random.uniform(0.995, 1.005)
-            else:
-                open_price = prices[i-1] * np.random.uniform(0.998, 1.002)
-            
-            # Adjust high/low to include open
-            high = max(high, open_price)
-            low = min(low, open_price)
-            
-            # Generate volume
-            volume = np.random.uniform(1000, 10000) * (1 + abs(returns[i]) * 10)
-            
-            data.append({
-                'open': open_price,
-                'high': high,
-                'low': low,
-                'close': close,
-                'volume': volume
-            })
-        
-        # Create DataFrame
-        df = pd.DataFrame(data, index=time_range)
-        
-        logger.info(f"Generated {len(df)} simulated data points")
-        
-        return _process_technical_indicators(df, original_start, original_end)
-        
-    except Exception as e:
-        logger.error(f"Error generating simulated data: {e}")
-        raise
-
-def _process_technical_indicators(df, original_start, original_end):
-    """Process technical indicators for the given dataframe"""
-    try:
-        # Ensure we have enough data for indicators
-        min_required = 60  # Need enough for MA50 + some buffer
-        if len(df) < min_required:
-            # Try to generate more data points if needed
-            if len(df) < 10:
-                raise ValueError(f"Insufficient data: only {len(df)} rows. Need at least 10 for trading simulation.")
-            else:
-                logger.warning(f"Limited data ({len(df)} rows), some indicators may be less reliable")
-        
-        logger.info(f"Processing technical indicators for {len(df)} rows of data")
-        
-        # Debug: Check data quality before indicators
-        logger.info(f"Data sample before indicators - Close price range: {df['close'].min():.2f} to {df['close'].max():.2f}")
-        logger.info(f"Data types: {df.dtypes.to_dict()}")
-        
-        # Technical indicators with error handling
-        try:
-            # Simple Moving Averages
-            sma20 = SMAIndicator(close=df['close'], window=20)
-            df['MA20'] = sma20.sma_indicator()
-            
-            # Add MA50 for trend analysis (only if we have enough data)
-            if len(df) >= 50:
-                sma50 = SMAIndicator(close=df['close'], window=50)
-                df['MA50'] = sma50.sma_indicator()
-            else:
-                # Fallback to MA20 for MA50 if insufficient data
-                df['MA50'] = df['MA20']
-                logger.warning("Using MA20 as fallback for MA50 due to insufficient data")
-            
-            # Debug: Check MA calculation
-            logger.info(f"MA20 calculated - valid values: {df['MA20'].notna().sum()}/{len(df)}")
-            
-            # Bollinger Bands
-            bb_indicator = BollingerBands(close=df['close'], window=20, window_dev=2)
-            df['UpperBB'] = bb_indicator.bollinger_hband()
-            df['MidBB'] = bb_indicator.bollinger_mavg()
-            df['LowerBB'] = bb_indicator.bollinger_lband()
-            
-            # Debug: Check BB calculation
-            logger.info(f"Bollinger Bands calculated - Upper valid: {df['UpperBB'].notna().sum()}, Lower valid: {df['LowerBB'].notna().sum()}")
-            
-            # RSI
-            rsi_indicator = RSIIndicator(close=df['close'], window=14)
-            df['RSI'] = rsi_indicator.rsi()
-            
-            # Debug: Check RSI calculation
-            logger.info(f"RSI calculated - valid values: {df['RSI'].notna().sum()}/{len(df)}, range: {df['RSI'].min():.1f} to {df['RSI'].max():.1f}")
-            
-            # MACD - Enhanced with all components
-            macd_indicator = MACD(close=df['close'], window_slow=26, window_fast=12, window_sign=9)
-            df['MACD_line'] = macd_indicator.macd()  # MACD line
-            df['MACD_signal'] = macd_indicator.macd_signal()  # Signal line
-            df['MACD_hist'] = macd_indicator.macd_diff()  # Histogram (MACD - Signal)
-            
-            # Debug: Check MACD calculation
-            logger.info(f"MACD calculated - Line valid: {df['MACD_line'].notna().sum()}, Signal valid: {df['MACD_signal'].notna().sum()}, Hist valid: {df['MACD_hist'].notna().sum()}")
-            
-        except Exception as indicator_error:
-            logger.error(f"Error calculating technical indicators: {indicator_error}")
-            raise ValueError(f"Failed to calculate technical indicators: {indicator_error}")
-        
-        # More robust NaN checking and cleaning
-        critical_indicators = ['MA20', 'RSI', 'UpperBB', 'LowerBB']
-        
-        # First, fill NaN values with forward/backward fill for technical indicators
-        # This handles the initial periods where indicators can't be calculated
-        for indicator in critical_indicators:
-            if indicator in df.columns:
-                df[indicator] = df[indicator].ffill().bfill()
-        
-        # Check if we still have significant NaN values after filling
-        nan_counts = {}
-        for indicator in critical_indicators:
-            if indicator in df.columns:
-                nan_count = df[indicator].isna().sum()
-                nan_pct = (nan_count / len(df)) * 100
-                nan_counts[indicator] = {'count': nan_count, 'percentage': nan_pct}
-                
-                # Only raise error if more than 50% of values are NaN after filling
-                if nan_pct > 50:
-                    logger.error(f"High NaN percentage for {indicator}: {nan_pct:.1f}%")
-                    raise ValueError(f"Too many NaN values for {indicator}: {nan_pct:.1f}% of data")
-        
-        logger.info(f"NaN counts after filling: {nan_counts}")
-        
-        # Drop rows where ANY critical indicator is still NaN (but be less aggressive)
-        before_drop = len(df)
-        df = df.dropna(subset=critical_indicators, how='any')
-        after_drop = len(df)
-        
-        dropped_rows = before_drop - after_drop
-        if dropped_rows > 0:
-            logger.info(f"Dropped {dropped_rows} rows with remaining NaN values")
-        
-        logger.info(f"After cleaning data: {after_drop} rows")
-        
-        # Final validation - be more lenient
-        if df.empty or len(df) < 10:
-            raise ValueError(f"Insufficient clean data after processing: only {len(df)} rows. Need at least 10 for trading simulation.")
-        
-        # Final fill of any remaining NaN values
-        df = df.ffill().bfill()
-        
-        # Filter dataframe to ORIGINAL user-requested date range
-        # Convert original dates to timezone-aware if the dataframe index is timezone-aware
-        filter_start = original_start
-        filter_end = original_end
-        
-        if df.index.tz is not None:
-            if filter_start.tzinfo is None:
-                filter_start = filter_start.replace(tzinfo=df.index.tz)
-            if filter_end.tzinfo is None:
-                filter_end = filter_end.replace(tzinfo=df.index.tz)
-        
-        # Filter to ORIGINAL requested date range (not the extended range)
-        original_len = len(df)
-        df = df[filter_start:filter_end]
-        filtered_len = len(df)
-        
-        if filtered_len < original_len:
-            logger.info(f"Filtered data to ORIGINAL requested date range ({original_start} to {original_end}): {original_len} -> {filtered_len} rows")
-        
-        # For very short periods (like 1 day), ensure we have at least some data
-        if len(df) < 5:
-            logger.warning(f"Very limited data after filtering ({len(df)} rows). Results may be less reliable for short time periods.")
-        
-        logger.info(f"Successfully processed {len(df)} rows with technical indicators for original date range {original_start} to {original_end}")
-        return df
-        
-    except Exception as e:
-        logger.error(f"Error processing technical indicators: {e}")
-        raise
-
-# ── POSTGRES CONNECTION ─────────────────────────────────────────────────────
 def get_db_config():
     """Get database configuration from environment variables"""
     return {
@@ -592,8 +319,9 @@ def pg_conn():
     try:
         return psycopg2.connect(**get_db_config())
     except Exception as e:
+        # Log only - never render UI from a connection helper, or the banner
+        # becomes the page's first Streamlit command and breaks set_page_config.
         logger.error(f"Database connection failed: {e}")
-        st.error(f"Database connection failed: {e}")
         raise
 
 def get_sqlalchemy_engine():
@@ -636,79 +364,28 @@ def init_database():
             # Warn if SQLAlchemy is not available
             if not SQLALCHEMY_AVAILABLE:
                 logger.warning("SQLAlchemy not available. Installing: pip install sqlalchemy psycopg2-binary")
-                st.sidebar.warning("📦 Install SQLAlchemy to eliminate pandas warnings: `pip install sqlalchemy psycopg2-binary`")
-            
+
             return True
     except Exception as e:
-        logger.error(f"Database initialization error: {e}")
-        st.sidebar.error(f"Database connection failed: {e}. Results won't be saved.")
-        
-        # Show configuration help
-        if "could not translate host name" in str(e):
-            st.sidebar.info("Check your .env file database configuration.")
-        
+        logger.error(f"Database initialization error: {e}. Results won't be saved.")
         return False
 
-# Try to initialize database
-database_available = init_database()
+@st.cache_resource(show_spinner=False)
+def get_database_available() -> bool:
+    """Resolve database availability lazily, once per app session.
 
-# ── SIMULATION FUNCTIONS ───────────────────────────────────────────────────
-def execute_trade(decision: TradingDecision, portfolio: dict, current_price: float, 
-                 config: TradingConfig, timestamp: datetime) -> dict:
-    """Execute a trading decision and update portfolio"""
-    
-    if decision.action == TradingAction.BUY and not portfolio['holding']:
-        # Calculate position size based on config
-        position_pct = config.position_size_pct / 100.0  # Convert percentage to decimal
-        max_spend = portfolio['cash'] * position_pct
-        fees = max_spend * config.buy_fee_pct / 100
-        net_spend = max_spend - fees
-        shares = net_spend / current_price
-        
-        portfolio['holdings'] = shares
-        portfolio['cash'] -= max_spend
-        portfolio['entry_price'] = current_price
-        portfolio['holding'] = True
-        
-        return {
-            'timestamp': timestamp,
-            'action': 'BUY',
-            'price': current_price,
-            'shares': shares,
-            'cost': max_spend,
-            'fees': fees,
-            'confidence': decision.confidence,
-            'reasoning': decision.reasoning,
-            'position_pct': config.position_size_pct
-        }
-        
-    elif decision.action == TradingAction.SELL and portfolio['holding']:
-        # Sell all holdings
-        gross_proceeds = portfolio['holdings'] * current_price
-        fees = gross_proceeds * config.sell_fee_pct / 100
-        net_proceeds = gross_proceeds - fees
-        
-        profit = net_proceeds - (portfolio['holdings'] * portfolio['entry_price'])
-        
-        portfolio['cash'] += net_proceeds
-        sold_shares = portfolio['holdings']
-        portfolio['holdings'] = 0.0
-        portfolio['entry_price'] = 0.0
-        portfolio['holding'] = False
-        
-        return {
-            'timestamp': timestamp,
-            'action': 'SELL',
-            'price': current_price,
-            'shares': sold_shares,
-            'proceeds': net_proceeds,
-            'fees': fees,
-            'profit': profit,
-            'confidence': decision.confidence,
-            'reasoning': decision.reasoning
-        }
-    
-    return None
+    Returns False immediately when persistence is disabled, so no connection
+    is attempted and no error surfaces at import time.
+    """
+    if not ENABLE_DATABASE:
+        logger.info("Database persistence disabled (ENABLE_DATABASE is not set). Results are kept in-session only.")
+        return False
+    return init_database()
+
+# ── EXECUTION ──────────────────────────────────────────────────────────────
+# Moved to core/execution.py so a headless run can execute fills without the UI.
+from core.execution import execute_trade  # noqa: E402
+from core.metrics import describe_run  # noqa: E402
 
 def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: list, symbol: str = None, show_reasoning: bool = True):
     """Display comprehensive simulation results with enhanced UI and trend recommendations"""
@@ -719,6 +396,115 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
     else:
         st.warning("📊 **TRADING SIMULATION COMPLETED - STRATEGY UNDERPERFORMED MARKET**")
     
+    # === RUN PROVENANCE & LLM CONTRIBUTION (PHASE 1 + 2) ===
+    meta = summary.get('run_metadata', {})
+    llm_report = summary.get('llm_report', {})
+
+    if meta:
+        if meta.get('publication_safe'):
+            st.success(
+                f"🔬 **Publication-safe run.** Data: {meta.get('data_source_label')}. "
+                f"Model: {meta.get('model', {}).get('deployment', meta.get('model', {}).get('model', 'n/a'))}. "
+                f"Execution: {meta.get('execution_mode')} with {meta.get('slippage_pct')}% slippage."
+            )
+        else:
+            # Since the legacy synthetic-post channel was removed, the price
+            # series is the only thing that can make a run unpublishable: both
+            # exogenous channels read from cached, hashed real corpora.
+            st.error(
+                "🚫 **NOT publication-safe: price data is synthetic.** "
+                "These numbers are valid for code testing only."
+            )
+
+        with st.expander("🔍 Run provenance (for the methods section)", expanded=False):
+            st.json(meta)
+
+    if llm_report:
+        st.subheader("🧠 LLM Contribution")
+        if not llm_report.get('llm_enabled'):
+            st.info("Rules-only ablation arm: the LLM was disabled for this run (USE_LLM_DECISIONS=false).")
+        else:
+            lc1, lc2, lc3, lc4 = st.columns(4)
+            with lc1:
+                st.metric("Decisions", llm_report.get('decisions', 0))
+            with lc2:
+                st.metric(
+                    "Changed by LLM",
+                    llm_report.get('decisions_changed_by_llm', 0),
+                    f"{llm_report.get('change_rate_pct', 0):.1f}% of decisions",
+                )
+            with lc3:
+                st.metric("Risk vetoes", llm_report.get('risk_vetoes', 0))
+            with lc4:
+                st.metric(
+                    "LLM call success",
+                    f"{llm_report.get('llm_success_rate_pct', 0):.0f}%",
+                    f"{llm_report.get('avg_llm_latency_s', 0):.1f}s avg",
+                )
+            if llm_report.get('llm_failures'):
+                st.warning(
+                    f"{llm_report['llm_failures']} LLM calls failed and fell back to the rule engine. "
+                    "Report this coverage figure alongside any result from this run."
+                )
+
+    # === EXOGENOUS SIGNAL CONTRIBUTION ===
+    # The counterpart to the LLM panel above, and the number that answers the
+    # only question that matters about a signal channel: did it change anything?
+    # A channel that ran on every bar and moved 0% of decisions is decorative,
+    # and that has to be visible rather than buried in a log line.
+    positioning_report = summary.get('positioning_report', {})
+    text_report = summary.get('text_sentiment_report', {})
+
+    if positioning_report or text_report:
+        st.subheader("📡 Exogenous Signal Contribution")
+
+        for report, title, off_hint in (
+            (positioning_report, "Futures positioning (Binance USD-M)",
+             "USE_POSITIONING_SIGNAL=false"),
+            (text_report, "Text sentiment (Hacker News)",
+             "USE_TEXT_SENTIMENT=false"),
+        ):
+            if not report:
+                continue
+            st.markdown(f"**{title}**")
+            if not report.get('enabled'):
+                st.info(f"Switched off for this run ({off_hint}). This is the "
+                        f"signal-off ablation arm.")
+                continue
+
+            agent_info = report.get('agent') or {}
+            if not agent_info.get('available'):
+                st.warning(
+                    f"Enabled but produced no usable readings: "
+                    f"{agent_info.get('status', 'unknown reason')}"
+                )
+                continue
+
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            with ec1:
+                st.metric("Decisions with a reading",
+                          report.get('decisions_with_reading', 0),
+                          f"of {report.get('decisions_total', 0)}")
+            with ec2:
+                st.metric("Decisions it moved",
+                          report.get('decisions_where_points_added', 0),
+                          f"{report.get('pct_decisions_moved', 0):.1f}% of decisions")
+            with ec3:
+                mean_score = report.get('mean_score')
+                st.metric("Mean score",
+                          "n/a" if mean_score is None else f"{mean_score:+.3f}")
+            with ec4:
+                st.metric("Bar coverage",
+                          f"{agent_info.get('coverage_pct', 0):.0f}%")
+
+            if report.get('decisions_where_points_added', 0) == 0:
+                st.warning(
+                    "This channel produced readings but never crossed its "
+                    "threshold, so it changed no trade in this run. Treat it as "
+                    "inactive when interpreting the result."
+                )
+            st.caption(agent_info.get('status', ''))
+
     # === EXECUTIVE SUMMARY SECTION ===
     st.header("📊 Executive Summary")
     
@@ -764,7 +550,39 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
             )
         else:
             st.metric("💰 Avg/Trade", "N/A", "No trades executed")
-    
+
+    # ── Risk-adjusted view ──────────────────────────────────────────────────
+    # Return alone says nothing about how the return was earned: doubling the
+    # position size doubles it and changes nothing about whether the signal is
+    # real. These were computed but never displayed before Phase 3.
+    st.subheader("📉 Risk-Adjusted Performance")
+    rcol1, rcol2, rcol3, rcol4 = st.columns(4)
+
+    def _ratio(value, fmt="{:.2f}"):
+        return fmt.format(value) if isinstance(value, (int, float)) else "—"
+
+    rcol1.metric("Sharpe (annualised)", _ratio(summary.get('sharpe_ratio')),
+                 "return per unit of total volatility")
+    rcol2.metric("Sortino (annualised)", _ratio(summary.get('sortino_ratio')),
+                 "penalises only downside")
+    rcol3.metric("Max Drawdown",
+                 _ratio(summary.get('max_drawdown_pct'), "{:.2f}%"),
+                 "worst peak-to-trough fall")
+    rcol4.metric("Calmar", _ratio(summary.get('calmar_ratio')),
+                 "return per unit of drawdown")
+
+    if summary.get('sample_warning'):
+        st.warning(
+            f"⚠️ {summary['sample_warning']} A drawdown is still shown because "
+            f"it is an observed fact about the path rather than an estimate."
+        )
+    else:
+        st.caption(
+            f"From {summary.get('observations', 0)} return observations. "
+            f"These describe THIS run only — they are not evidence the strategy "
+            f"generalises. Use the ablation's bootstrap intervals for that."
+        )
+
     # === NEXT TREND RECOMMENDATION SECTION ===
     st.header("🔮 Next Action Recommendation")
     st.markdown("*Multi-Agent Analysis for Next Trading Decision*")
@@ -873,40 +691,184 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
             
             st.markdown(f"**TA Recommendation: {ta_color} {ta_recommendation}** (Score: {ta_score:+d})")
         
-        # Sentiment Analysis Agent
-        with st.expander("🎭 Sentiment Analysis Agent"):
-            # Get latest sentiment from decisions_log
-            latest_sentiment = None
-            if decisions_log:
-                for decision in reversed(decisions_log):
-                    if 'sentiment' in decision and decision['sentiment']:
-                        latest_sentiment = decision['sentiment']
-                        break
-            
-            if latest_sentiment and isinstance(latest_sentiment, dict):
-                sentiment_score = latest_sentiment.get('sentiment_score', 0)
-                sentiment_confidence = latest_sentiment.get('confidence', 0)
-                
-                if sentiment_score > 0.2:
-                    sentiment_signal = "🟢 Bullish Sentiment"
-                    sentiment_recommendation = "BUY"
-                elif sentiment_score < -0.2:
-                    sentiment_signal = "🔴 Bearish Sentiment"
-                    sentiment_recommendation = "SELL"
+        # ── Text Sentiment Agent (Hacker News) ──────────────────────────────
+        # This panel used to read decisions_log['sentiment'], the synthetic-post
+        # channel that Phase 2 switched off, so it always printed "No recent
+        # sentiment data available". It now reads the real text sentiment
+        # channel, and reports the exact points it contributed to the trade
+        # rather than inventing a separate BUY/SELL vote from the same number.
+        latest_text = None
+        if decisions_log:
+            for decision in reversed(decisions_log):
+                if decision.get('text_sentiment'):
+                    latest_text = decision['text_sentiment']
+                    break
+
+        text_available = bool(latest_text and latest_text.get('available'))
+        header = "💬 Text Sentiment Agent (Hacker News)"
+        with st.expander(header, expanded=True):
+            if text_available:
+                t_score = latest_text.get('score', 0.0)
+                t_points = (latest_text.get('bullish_points', 0)
+                            - latest_text.get('bearish_points', 0))
+                if t_score > 0:
+                    text_signal, sentiment_recommendation = "🟢 Bullish", "BUY"
+                elif t_score < 0:
+                    text_signal, sentiment_recommendation = "🔴 Bearish", "SELL"
                 else:
-                    sentiment_signal = "⚪ Neutral Sentiment"
-                    sentiment_recommendation = "HOLD"
-                
-                st.write(f"• **Social Media Score:** {sentiment_score:+.3f}")
-                st.write(f"• **Confidence:** {sentiment_confidence:.2f}")
-                st.write(f"• **Signal:** {sentiment_signal}")
-                st.write(f"• **Market Impact:** {latest_sentiment.get('market_impact', 'Neutral')}")
-                st.markdown(f"**Sentiment Recommendation: {sentiment_recommendation}**")
-            else:
-                st.write("• No recent sentiment data available")
-                st.markdown("**Sentiment Recommendation: HOLD** (No data)")
+                    text_signal, sentiment_recommendation = "⚪ Neutral", "HOLD"
+
+                t_feat = latest_text.get('features') or {}
+                t_z = t_feat.get('z_mean_sentiment')
+                pos_share = t_feat.get('pos_share')
+                neg_share = t_feat.get('neg_share')
+
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("Sentiment score", f"{t_score:+.3f}")
+                col_b.metric("Documents", f"{latest_text.get('doc_count', 0)}")
+                col_c.metric("Signal points", f"{t_points:+d}")
+
+                st.write(f"• **Signal:** {text_signal}")
+                if t_z is not None:
+                    st.write(f"• **Trend strength:** z = {t_z:+.2f} "
+                             f"versus its own trailing baseline")
+                if pos_share is not None and neg_share is not None:
+                    neutral = max(0.0, 1.0 - pos_share - neg_share)
+                    st.write(f"• **Document mix:** {pos_share:.0%} positive · "
+                             f"{neg_share:.0%} negative · {neutral:.0%} neutral")
+                st.write(f"• **Mean raw sentiment:** "
+                         f"{latest_text.get('mean_sentiment') or 0:+.3f} "
+                         f"(before de-trending)")
+                st.write(f"• **Confidence (data quality):** "
+                         f"{latest_text.get('confidence', 0):.2f}")
+
+                # The arithmetic that turned a z-score into rule points. Without
+                # it a reading like "+0.221 -> 0 points" looks arbitrary, which
+                # is the single most common question this panel gets.
+                if t_z is not None:
+                    cap = int(TEXT_SENTIMENT_MAX_POINTS)
+                    ladder = []
+                    for thr, awarded in TEXT_POINT_THRESHOLDS:
+                        if awarded > cap:
+                            continue
+                        ladder.append(f"|z| ≥ {thr * TEXT_Z_CLIP:.2f} → ±{awarded}")
+                    st.markdown(
+                        f"**How this became {t_points:+d} point(s):** "
+                        f"`z = {t_z:+.2f}` → `score = z / {TEXT_Z_CLIP:.1f} = "
+                        f"{t_score:+.3f}` → **{t_points:+d}**  \n"
+                        f"Thresholds: {', '.join(ladder)} "
+                        f"(capped at ±{cap} this run via TEXT_SENTIMENT_MAX_POINTS)."
+                    )
+
+                examples = latest_text.get('examples') or []
+                if examples:
+                    # Rendered inline, not in a nested expander: this block is
+                    # already inside the agent's own expander and Streamlit
+                    # forbids one expander inside another. A widget-based
+                    # disclosure (checkbox/toggle) is no good either — clicking
+                    # it reruns the script, and this whole results panel only
+                    # renders during a simulation run, so the page would go
+                    # blank. At most EXAMPLES_PER_DIRECTION * 2 documents of
+                    # 200 chars each land here, so inline costs a few lines.
+                    st.markdown(
+                        f"**📄 What it actually read** ({len(examples)} of "
+                        f"{latest_text.get('doc_count', 0)} documents in the "
+                        f"{TEXT_SENTIMENT_WINDOW_HOURS}h window)"
+                    )
+                    st.caption(
+                        "Strongest bullish and bearish documents in this "
+                        "bar's window, from the same half-open interval "
+                        "used to compute the score — nothing here was "
+                        "published at or after the bar's cutoff."
+                    )
+                    for doc in examples:
+                        s = doc.get('sentiment', 0.0)
+                        icon = "🟢" if s > 0.05 else ("🔴" if s < -0.05 else "⚪")
+                        when = str(doc.get('created_at', ''))[:16].replace('T', ' ')
+                        st.markdown(
+                            f"{icon} `{s:+.3f}`  *{doc.get('kind', '')}*  "
+                            f"{when}  ·  {doc.get('chars', 0)} chars  \n"
+                            f"{doc.get('text', '')}"
+                        )
+                else:
+                    st.caption(latest_text.get('reasoning', ''))
+
+                st.markdown(f"**Text Sentiment Recommendation: "
+                            f"{sentiment_recommendation}**")
+            elif latest_text:
                 sentiment_recommendation = "HOLD"
-        
+                st.info(f"No usable reading: {latest_text.get('reasoning', '')}")
+                st.caption("An unavailable channel contributes nothing to the "
+                           "trade. It is not counted as a neutral vote.")
+            else:
+                sentiment_recommendation = "HOLD"
+                st.info("Text sentiment is switched off for this run "
+                        "(USE_TEXT_SENTIMENT=false).")
+                st.caption("Turn it on in .env to add Hacker News sentiment to "
+                           "the signal score.")
+
+        # ── Futures Positioning Agent (Binance USD-M) ───────────────────────
+        latest_pos = None
+        if decisions_log:
+            for decision in reversed(decisions_log):
+                if decision.get('positioning'):
+                    latest_pos = decision['positioning']
+                    break
+
+        pos_available = bool(latest_pos and latest_pos.get('available'))
+        # Expanded even when unavailable. A collapsed panel next to a populated
+        # one reads as "this channel is missing" rather than "this channel has
+        # no data for the most recent bar", which is a different claim.
+        with st.expander("📡 Futures Positioning Agent", expanded=True):
+            if pos_available:
+                p_score = latest_pos.get('score', 0.0)
+                p_points = (latest_pos.get('bullish_points', 0)
+                            - latest_pos.get('bearish_points', 0))
+                if p_score > 0:
+                    pos_signal, positioning_recommendation = "🟢 Bullish", "BUY"
+                elif p_score < 0:
+                    pos_signal, positioning_recommendation = "🔴 Bearish", "SELL"
+                else:
+                    pos_signal, positioning_recommendation = "⚪ Neutral", "HOLD"
+
+                col_a, col_b, col_c = st.columns(3)
+                col_a.metric("Positioning score", f"{p_score:+.3f}")
+                col_b.metric("Signal points", f"{p_points:+d}")
+                col_c.metric("Confidence", f"{latest_pos.get('confidence', 0):.2f}")
+
+                features = latest_pos.get('features') or {}
+                labels = {
+                    'z_count_long_short_ratio': 'Crowd long/short (faded)',
+                    'z_sum_toptrader_long_short_ratio': 'Top traders (followed)',
+                    'z_sum_taker_long_short_vol_ratio': 'Taker flow (followed)',
+                }
+                st.write(f"• **Signal:** {pos_signal}")
+                for key, label in labels.items():
+                    z = features.get(key)
+                    if z is None:
+                        continue
+                    st.write(f"• **{label}:** z = {z:+.2f}")
+                st.caption(latest_pos.get('reasoning', ''))
+                st.markdown(f"**Positioning Recommendation: "
+                            f"{positioning_recommendation}**")
+            elif latest_pos:
+                positioning_recommendation = "HOLD"
+                st.info(f"No usable reading for the latest bar: "
+                        f"{latest_pos.get('reasoning', '')}")
+                st.caption(
+                    "Binance publishes futures positioning as one file per "
+                    "**completed** day, so the most recent 24-48 hours are "
+                    "normally absent. That is a property of the free feed, not "
+                    "a fault: this channel can inform a backtest but never a "
+                    "live next-bar decision. Earlier bars in the run above may "
+                    "still have had readings — see the coverage figure in the "
+                    "Exogenous Signal Contribution panel."
+                )
+            else:
+                positioning_recommendation = "HOLD"
+                st.info("Futures positioning is switched off for this run "
+                        "(USE_POSITIONING_SIGNAL=false).")
+
         # Risk Management Agent
         with st.expander("⚠️ Risk Management Agent"):
             # Get latest risk assessment
@@ -962,15 +924,27 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
         else:
             hold_votes += 1
         
-        # Count Sentiment votes
-        if 'sentiment_recommendation' in locals():
+        # Count Text Sentiment votes. Only a channel that actually produced a
+        # reading gets a vote: an unavailable channel voting HOLD would let a
+        # dead feed tilt the tally, which is how the old sentiment agent looked
+        # like it was participating while contributing nothing.
+        if text_available and 'sentiment_recommendation' in locals():
             if sentiment_recommendation == "BUY":
                 buy_votes += 1
             elif sentiment_recommendation == "SELL":
                 sell_votes += 1
             else:
                 hold_votes += 1
-        
+
+        # Count Positioning votes, same rule
+        if pos_available and 'positioning_recommendation' in locals():
+            if positioning_recommendation == "BUY":
+                buy_votes += 1
+            elif positioning_recommendation == "SELL":
+                sell_votes += 1
+            else:
+                hold_votes += 1
+
         # Count Risk votes
         if 'risk_recommendation' in locals():
             if risk_recommendation == "BUY":
@@ -1179,8 +1153,12 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
         chart_df['timestamp'] = pd.to_datetime(chart_df['timestamp'])
         chart_df.set_index('timestamp', inplace=True)
         
-        # Add buy & hold comparison
-        initial_price = df.iloc[20]['close']
+        # Add buy & hold comparison. This must use the same first traded bar as
+        # the engine's buy_hold_return (see the summary calculation), or the
+        # chart and the reported number quietly disagree -- which is why the
+        # index is the shared constant and not a literal repeated here.
+        baseline_idx = min(INDICATOR_WARMUP_BARS, len(df) - 1)
+        initial_price = df.iloc[baseline_idx]['close']
         chart_df['buy_hold_value'] = summary['initial_capital'] * (chart_df['price'] / initial_price)
         
         st.line_chart(chart_df[['portfolio_value', 'buy_hold_value']])
@@ -1508,61 +1486,14 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
     # Chart completion message (shown after spinner completes)
     st.success("✅ Technical analysis charts generated successfully!")
 
-    # Enhanced Trade Log with P&L and P&L% and Sentiment Analysis
+    # Trade log with P&L and P&L%. The "Sentiment Context" column was removed
+    # with the legacy channel: it only ever showed 0.000 for every trade.
     if summary['trades']:
-        st.subheader("📋 Trade History with P&L Analysis & Sentiment Context")
+        st.subheader("📋 Trade History with P&L Analysis")
         trades_df = pd.DataFrame(summary['trades'])
-        
-        # Add sentiment information to trades
-        sentiment_data = []
-        if decisions_log:
-            for decision in decisions_log:
-                if 'sentiment' in decision and decision['sentiment']:
-                    sentiment_entry = {
-                        'timestamp': decision['timestamp'],
-                        'sentiment_score': decision['sentiment'].get('sentiment_score', 0),
-                        'market_impact': decision['sentiment'].get('market_impact', 'neutral'),
-                        'post_details': decision['sentiment'].get('post_details', []),
-                        'reasoning': decision['sentiment'].get('reasoning', 'No reasoning available'),
-                        'confidence': decision['sentiment'].get('confidence', 0)
-                    }
-                    sentiment_data.append(sentiment_entry)
         
         # Format the trades DataFrame for better display
         if not trades_df.empty:
-            # Add sentiment context to each trade
-            trades_df['sentiment_context'] = 'No data'
-            trades_df['sentiment_score'] = 0.0
-            
-            for idx, trade in trades_df.iterrows():
-                trade_time = pd.to_datetime(trade['timestamp'])
-                
-                # Find closest sentiment data
-                closest_sentiment = None
-                min_time_diff = float('inf')
-                
-                for sentiment in sentiment_data:
-                    sentiment_time = pd.to_datetime(sentiment['timestamp']) if isinstance(sentiment['timestamp'], str) else sentiment['timestamp']
-                    time_diff = abs((trade_time - sentiment_time).total_seconds())
-                    
-                    if time_diff < min_time_diff:
-                        min_time_diff = time_diff
-                        closest_sentiment = sentiment
-                
-                if closest_sentiment and min_time_diff < 3600:  # Within 1 hour
-                    sentiment_score = closest_sentiment['sentiment_score']
-                    market_impact = closest_sentiment.get('market_impact', 'neutral')
-                    trades_df.at[idx, 'sentiment_score'] = sentiment_score
-                    
-                    # Create detailed sentiment context with score and impact
-                    if sentiment_score > 0.2:
-                        trades_df.at[idx, 'sentiment_context'] = f"🟢 Bullish ({sentiment_score:+.3f}) - {market_impact[:30]}..."
-                    elif sentiment_score < -0.2:
-                        trades_df.at[idx, 'sentiment_context'] = f"🔴 Bearish ({sentiment_score:+.3f}) - {market_impact[:30]}..."
-                    else:
-                        trades_df.at[idx, 'sentiment_context'] = f"🟡 Neutral ({sentiment_score:+.3f}) - {market_impact[:30]}..."
-                else:
-                    trades_df.at[idx, 'sentiment_context'] = 'No sentiment data within 1hr'
             # Format timestamp column
             if 'timestamp' in trades_df.columns:
                 trades_df['timestamp'] = pd.to_datetime(trades_df['timestamp']).dt.strftime('%Y-%m-%d %H:%M')
@@ -1669,9 +1600,6 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
             # Add P&L columns
             display_columns.extend(['profit_display', 'profit_pct_display'])
             
-            # Add sentiment context
-            display_columns.append('sentiment_context')
-            
             # Add other relevant columns (excluding fees)
             other_columns = ['confidence', 'reasoning']
             for col in other_columns:
@@ -1686,7 +1614,6 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
             display_df = display_df.rename(columns={
                 'profit_display': 'P&L',
                 'profit_pct_display': 'P&L %',
-                'sentiment_context': 'Sentiment Context'
             })
             
             # Apply color formatting for profit columns
@@ -1717,463 +1644,15 @@ def display_simulation_results(summary: dict, df: pd.DataFrame, decisions_log: l
                     st.dataframe(styled_df, use_container_width=True)
                 else:
                     st.dataframe(display_df, use_container_width=True)
-            except Exception as e:
+            except Exception:
                 # Fallback: display without styling
                 st.dataframe(display_df, use_container_width=True)
             
-            # Detailed Sentiment Analysis for Trading Period
-            if sentiment_data:
-                st.markdown("#### 🎭 Sentiment Analysis Details During Trading Period")
-                st.markdown("*Social media sentiment data that influenced trading decisions*")
-                
-                # Create sentiment timeline
-                sentiment_timeline = []
-                for sentiment in sentiment_data:
-                    sentiment_timeline.append({
-                        'timestamp': sentiment['timestamp'],
-                        'score': sentiment['sentiment_score'],
-                        'impact': sentiment.get('market_impact', 'No impact data'),
-                        'post_details': sentiment.get('post_details', []),
-                        'reasoning': sentiment.get('reasoning', 'No reasoning available'),
-                        'confidence': sentiment.get('confidence', 0),
-                        'formatted_time': pd.to_datetime(sentiment['timestamp']).strftime('%Y-%m-%d %H:%M') if isinstance(sentiment['timestamp'], str) else sentiment['timestamp'].strftime('%Y-%m-%d %H:%M')
-                    })
-                
-                # Sort by timestamp
-                sentiment_timeline.sort(key=lambda x: x['timestamp'])
-                
-                # Display sentiment timeline in expandable sections
-                for i, sentiment in enumerate(sentiment_timeline):
-                    score = sentiment['score']
-                    
-                    # Color code based on sentiment
-                    if score > 0.2:
-                        emoji = "🟢"
-                        label = "Bullish"
-                        color = "green"
-                    elif score < -0.2:
-                        emoji = "🔴"
-                        label = "Bearish"  
-                        color = "red"
-                    else:
-                        emoji = "🟡"
-                        label = "Neutral"
-                        color = "orange"
-                    
-                    with st.expander(f"{emoji} {sentiment['formatted_time']} - {label} Sentiment ({score:+.3f})", expanded=False):
-                        col1, col2 = st.columns([1, 2])
-                        
-                        with col1:
-                            st.metric("Sentiment Score", f"{score:+.3f}", f"{label}")
-                            st.write(f"**Timestamp:** {sentiment['formatted_time']}")
-                            st.write(f"**Confidence:** {sentiment.get('confidence', 0):.1%}")
-                        
-                        with col2:
-                            st.write(f"**Market Impact Assessment:**")
-                            st.write(sentiment['impact'])
-                            
-                            # Display actual post statements
-                            posts = sentiment.get('post_details', [])
-                            if posts:
-                                # Filter posts to show variety and time-relevance for this specific sentiment period
-                                sentiment_time = pd.to_datetime(sentiment['timestamp']) if isinstance(sentiment['timestamp'], str) else sentiment['timestamp']
-                                sentiment_hour = sentiment_time.hour
-                                sentiment_index = i  # Current sentiment index
-                                
-                                # Create time-specific post selection to show variety
-                                time_filtered_posts = []
-                                for j, post in enumerate(posts):
-                                    # Use sentiment index and hour to create variation in posts shown
-                                    post_relevance_score = (j + sentiment_index + sentiment_hour) % len(posts)
-                                    if post_relevance_score < 3:  # Show up to 3 most relevant posts
-                                        # Create time-specific variations of the post
-                                        base_text = post.get('text', 'No text available')
-                                        post_score = post.get('combined_score', post.get('score', 0))
-                                        username = post.get('username', 'Unknown')
-                                        
-                                        # Add time-specific context to make posts appear different
-                                        if 'trump' in username.lower():
-                                            if sentiment_hour < 12:
-                                                time_context = "morning market outlook"
-                                            elif sentiment_hour < 18:
-                                                time_context = "afternoon trading session"
-                                            else:
-                                                time_context = "evening market wrap"
-                                        elif 'musk' in username.lower():
-                                            if sentiment_hour < 10:
-                                                time_context = "pre-market thoughts"
-                                            elif sentiment_hour < 16:
-                                                time_context = "market hours commentary"
-                                            else:
-                                                time_context = "after-hours discussion"
-                                        else:
-                                            time_context = f"market sentiment at {sentiment_hour:02d}:00"
-                                        
-                                        # Create realistic timestamps around the sentiment time
-                                        post_time_offset = j * 15  # 15 minutes apart
-                                        post_timestamp = sentiment_time - pd.Timedelta(minutes=post_time_offset)
-                                        
-                                        time_filtered_posts.append({
-                                            'text': base_text,
-                                            'score': post_score,
-                                            'username': username,
-                                            'timestamp': post_timestamp,
-                                            'context': time_context
-                                        })
-                                
-                                st.write(f"**Social Media Posts Analyzed ({len(time_filtered_posts)} posts):**")
-                                for j, post in enumerate(time_filtered_posts):
-                                    post_text = post.get('text', 'No text available')
-                                    post_score = post.get('score', 0)
-                                    username = post.get('username', 'Unknown')
-                                    timestamp = post.get('timestamp', sentiment_time)
-                                    context = post.get('context', '')
-                                    
-                                    # Format timestamp
-                                    try:
-                                        formatted_post_time = timestamp.strftime('%H:%M')
-                                    except:
-                                        formatted_post_time = 'Unknown time'
-                                    
-                                    with st.container():
-                                        st.markdown(f"""
-                                        **Post {j+1}** ({formatted_post_time}) - @{username}  
-                                        Score: {post_score:+.3f} | Context: {context}  
-                                        *"{post_text}"*
-                                        """)
-                                
-                                if len(posts) > len(time_filtered_posts):
-                                    st.write(f"*... and {len(posts) - len(time_filtered_posts)} more posts from this time period*")
-                            else:
-                                st.write("*No specific post data available*")
-                            
-                            # Show how this sentiment affected nearby trades
-                            sentiment_time = pd.to_datetime(sentiment['timestamp']) if isinstance(sentiment['timestamp'], str) else sentiment['timestamp']
-                            nearby_trades = []
-                            
-                            for idx, trade in trades_df.iterrows():
-                                trade_time = pd.to_datetime(trade['timestamp'])
-                                time_diff = abs((trade_time - sentiment_time).total_seconds())
-                                
-                                if time_diff < 3600:  # Within 1 hour
-                                    nearby_trades.append({
-                                        'action': trade['action'],
-                                        'time': trade['timestamp'],
-                                        'time_diff_minutes': int(time_diff / 60)
-                                    })
-                            
-                            if nearby_trades:
-                                st.write(f"**Related Trades (within 1 hour):**")
-                                for trade in nearby_trades:
-                                    st.write(f"• {trade['action']} at {trade['time']} ({trade['time_diff_minutes']} min away)")
-                            else:
-                                st.write("*No trades within 1 hour of this sentiment*")
-                
-                # Summary statistics
-                st.markdown("##### 📊 Sentiment Summary Statistics")
-                avg_sentiment = sum(s['score'] for s in sentiment_timeline) / len(sentiment_timeline)
-                bullish_count = sum(1 for s in sentiment_timeline if s['score'] > 0.2)
-                bearish_count = sum(1 for s in sentiment_timeline if s['score'] < -0.2)
-                neutral_count = len(sentiment_timeline) - bullish_count - bearish_count
-                
-                summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
-                
-                with summary_col1:
-                    st.metric("Average Sentiment", f"{avg_sentiment:+.3f}")
-                
-                with summary_col2:
-                    st.metric("🟢 Bullish Periods", bullish_count, f"{bullish_count/len(sentiment_timeline)*100:.1f}%")
-                
-                with summary_col3:
-                    st.metric("🔴 Bearish Periods", bearish_count, f"{bearish_count/len(sentiment_timeline)*100:.1f}%")
-                
-                with summary_col4:
-                    st.metric("🟡 Neutral Periods", neutral_count, f"{neutral_count/len(sentiment_timeline)*100:.1f}%")
-            
-            else:
-                st.info("💭 No sentiment analysis data available for this trading period")
         else:
             st.info("No trades executed during the simulation.")
     else:
         st.info("No trades executed during the simulation.")
     
-    # === SENTIMENT ANALYSIS RESULTS ===
-    st.subheader("🎭 Social Media Sentiment Analysis")
-    st.markdown("*Analysis of influential Twitter accounts (Elon Musk, Donald Trump) and their market impact*")
-    
-    # Check if sentiment data is available in decisions_log
-    sentiment_data = []
-    if decisions_log:
-        for decision in decisions_log:
-            if 'sentiment' in decision and decision['sentiment']:
-                sentiment_data.append(decision['sentiment'])
-    
-    if sentiment_data:
-        # Calculate overall sentiment metrics
-        total_sentiment_score = sum(s.get('sentiment_score', 0) for s in sentiment_data) / len(sentiment_data)
-        avg_confidence = sum(s.get('confidence', 0) for s in sentiment_data) / len(sentiment_data)
-        
-        # Display sentiment overview
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            sentiment_color = "🟢" if total_sentiment_score > 0.1 else "🔴" if total_sentiment_score < -0.1 else "🟡"
-            st.metric(
-                "Overall Sentiment",
-                f"{sentiment_color} {total_sentiment_score:.3f}",
-                f"{'Bullish' if total_sentiment_score > 0 else 'Bearish' if total_sentiment_score < 0 else 'Neutral'}"
-            )
-        
-        with col2:
-            st.metric(
-                "Confidence Level",
-                f"{avg_confidence:.2f}",
-                f"{len(sentiment_data)} data points"
-            )
-            
-        with col3:
-            data_quality = sentiment_data[-1].get('data_quality', 'unknown') if sentiment_data else 'No data'
-            accounts = sentiment_data[-1].get('account_count', 0) if sentiment_data else 0
-            st.metric(
-                "Data Quality",
-                data_quality.title(),
-                f"{accounts} accounts"
-            )
-        
-        # Detailed sentiment breakdown by account
-        st.markdown("#### 📊 Detailed Sentiment Analysis by Account")
-        
-        # Get sentiment data from decisions_log
-        combined_sentiment_data = {}
-        if sentiment_data:
-            # Extract detailed sentiment data from the last sentiment analysis
-            last_sentiment = sentiment_data[-1] if sentiment_data else {}
-            combined_sentiment_data = {
-                'sentiment_score': last_sentiment.get('sentiment_score', 0.0),
-                'confidence': last_sentiment.get('confidence', 0.0),
-                'market_impact': last_sentiment.get('reasoning', 'No analysis available'),
-                'trump_posts': [],  # Will be populated with simulated data
-                'musk_posts': [],   # Will be populated with simulated data
-                'post_details': []  # Will be populated with simulated data
-            }
-        
-        trump_posts = combined_sentiment_data.get('trump_posts', [])
-        musk_posts = combined_sentiment_data.get('musk_posts', [])
-        all_posts = combined_sentiment_data.get('post_details', [])
-        
-        # Create tabs for different accounts
-        tab1, tab2, tab3 = st.tabs(["🚀 Elon Musk", "🇺🇸 Donald Trump", "📈 Combined Analysis"])
-        
-        with tab1:
-            st.markdown("**Elon Musk Twitter Analysis**")
-            st.markdown("*CEO of Tesla & SpaceX - High crypto market influence*")
-            
-            if musk_posts:
-                # Display actual Musk posts
-                for i, post in enumerate(musk_posts):
-                    sentiment_score = post.get('combined_score', 0.0)
-                    sentiment_icon = "🟢" if sentiment_score > 0.2 else "🔴" if sentiment_score < -0.2 else "🟡"
-                    
-                    with st.expander(f"{sentiment_icon} Post {i+1}: {post['text'][:50]}... (Sentiment: {sentiment_score:+.2f})"):
-                        st.write(f"**Full Text:** {post['text']}")
-                        st.write(f"**Username:** {post.get('username', 'N/A')}")
-                        st.write(f"**Timestamp:** {post.get('timestamp', 'N/A')}")
-                        st.write(f"**TextBlob Score:** {post.get('textblob_score', 0):+.3f}")
-                        st.write(f"**VADER Score:** {post.get('vader_score', 0):+.3f}")
-                        st.write(f"**Combined Score:** {sentiment_score:+.3f}")
-                        st.write(f"**Label:** {post.get('sentiment_label', 'neutral').title()}")
-                        
-                        # Sentiment interpretation
-                        if sentiment_score > 0.2:
-                            st.success("🟢 **Positive Impact**: Likely to boost market confidence")
-                        elif sentiment_score < -0.2:
-                            st.error("🔴 **Negative Impact**: May cause market concern")
-                        else:
-                            st.info("🟡 **Neutral Impact**: Limited market effect expected")
-                
-                # Musk summary stats
-                musk_avg = sum(p.get('combined_score', 0) for p in musk_posts) / len(musk_posts) if musk_posts else 0
-                st.metric("Elon Musk Avg Sentiment", f"{musk_avg:+.3f}", "High market influence (60% weight)")
-            else:
-                st.info("No Elon Musk posts found in the current analysis")
-                st.markdown("**Simulated Example Posts:**")
-                # Show example posts if no real data
-                example_posts = [
-                    {"text": "The future of cryptocurrency looks promising. Innovation is key.", "score": 0.65},
-                    {"text": "Dogecoin to the moon! 🚀", "score": 0.80},
-                    {"text": "Bitcoin is the future of money.", "score": 0.70}
-                ]
-                for post in example_posts:
-                    st.write(f"• {post['text']} (Score: {post['score']:+.2f})")
-        
-        with tab2:
-            st.markdown("**Donald Trump Twitter Analysis**")
-            st.markdown("*Former President - Significant economic/market influence*")
-            
-            if trump_posts:
-                # Display actual Trump posts
-                for i, post in enumerate(trump_posts):
-                    sentiment_score = post.get('combined_score', 0.0)
-                    sentiment_icon = "🟢" if sentiment_score > 0.2 else "🔴" if sentiment_score < -0.2 else "🟡"
-                    
-                    with st.expander(f"{sentiment_icon} Post {i+1}: {post['text'][:50]}... (Sentiment: {sentiment_score:+.2f})"):
-                        st.write(f"**Full Text:** {post['text']}")
-                        st.write(f"**Username:** {post.get('username', 'N/A')}")
-                        st.write(f"**Timestamp:** {post.get('timestamp', 'N/A')}")
-                        st.write(f"**TextBlob Score:** {post.get('textblob_score', 0):+.3f}")
-                        st.write(f"**VADER Score:** {post.get('vader_score', 0):+.3f}")
-                        st.write(f"**Combined Score:** {sentiment_score:+.3f}")
-                        st.write(f"**Label:** {post.get('sentiment_label', 'neutral').title()}")
-                        
-                        # Sentiment interpretation
-                        if sentiment_score > 0.2:
-                            st.success("🟢 **Positive Impact**: Likely to boost market confidence")
-                        elif sentiment_score < -0.2:
-                            st.error("🔴 **Negative Impact**: May cause market concern")
-                        else:
-                            st.info("🟡 **Neutral Impact**: Limited market effect expected")
-                
-                # Trump summary stats
-                trump_avg = sum(p.get('combined_score', 0) for p in trump_posts) / len(trump_posts) if trump_posts else 0
-                st.metric("Donald Trump Avg Sentiment", f"{trump_avg:+.3f}", "Moderate market influence (40% weight)")
-            else:
-                st.info("No Donald Trump posts found in the current analysis")
-                st.markdown("**Simulated Example Posts:**")
-                # Show example posts if no real data
-                example_posts = [
-                    {"text": "The market is doing very well under strong leadership.", "score": 0.55},
-                    {"text": "American economy is the strongest it's ever been.", "score": 0.60},
-                    {"text": "Investment opportunities are tremendous right now.", "score": 0.50}
-                ]
-                for post in example_posts:
-                    st.write(f"• {post['text']} (Score: {post['score']:+.2f})")
-        
-        with tab3:
-            st.markdown("**Combined Sentiment Analysis & Market Impact**")
-            
-            # Use actual sentiment analysis results
-            overall_sentiment = combined_sentiment_data.get('sentiment_score', 0.0)
-            confidence = combined_sentiment_data.get('confidence', 0.0)
-            market_impact = combined_sentiment_data.get('market_impact', 'No analysis available')
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.metric(
-                    "Overall Sentiment Score",
-                    f"{overall_sentiment:+.3f}",
-                    f"Confidence: {confidence:.1%}"
-                )
-                
-                # Display market impact
-                st.markdown("**🎯 Market Impact Assessment**")
-                if overall_sentiment > 0.2:
-                    st.success("🟢 **Bullish Sentiment**")
-                elif overall_sentiment < -0.2:
-                    st.error("🔴 **Bearish Sentiment**")
-                else:
-                    st.info("🟡 **Neutral Sentiment**")
-                
-                st.write(market_impact)
-                
-                # Post distribution
-                if all_posts:
-                    st.markdown("**📊 Post Distribution**")
-                    sentiment_counts = {'Positive': 0, 'Negative': 0, 'Neutral': 0}
-                    for post in all_posts:
-                        label = post.get('sentiment_label', 'neutral').title()
-                        if label in sentiment_counts:
-                            sentiment_counts[label] += 1
-                    
-                    for label, count in sentiment_counts.items():
-                        st.write(f"• {label}: {count} posts")
-            
-            with col2:
-                st.markdown("**📈 Trading Signal Analysis**")
-                
-                if overall_sentiment > 0.3:
-                    st.success("🟢 **Strong Buy Signal from Sentiment**")
-                    st.write("• High positive sentiment detected")
-                    st.write("• Recommendation: Consider increasing position size")
-                    st.write("• Risk: Monitor for sentiment reversals")
-                elif overall_sentiment > 0.1:
-                    st.info("🟡 **Weak Buy Signal from Sentiment**")
-                    st.write("• Moderate positive sentiment")
-                    st.write("• Recommendation: Standard position sizing")
-                    st.write("• Continue monitoring sentiment trends")
-                elif overall_sentiment < -0.3:
-                    st.error("🔴 **Strong Sell Signal from Sentiment**")
-                    st.write("• High negative sentiment detected")
-                    st.write("• Recommendation: Reduce positions")
-                    st.write("• Risk: Potential overselling opportunity")
-                elif overall_sentiment < -0.1:
-                    st.warning("🟡 **Weak Sell Signal from Sentiment**")
-                    st.write("• Moderate negative sentiment")
-                    st.write("• Recommendation: Cautious positioning")
-                    st.write("• Monitor for trend confirmation")
-                else:
-                    st.info("🟡 **Neutral Sentiment**")
-                    st.write("• No clear sentiment direction")
-                    st.write("• Recommendation: Follow technical signals")
-                    st.write("• Sentiment not a primary factor")
-                
-                # Analysis quality
-                st.markdown("**📋 Analysis Quality**")
-                data_quality = combined_sentiment_data.get('data_quality', 'simulated')
-                account_count = combined_sentiment_data.get('account_count', 2)
-                
-                st.write(f"• Data Quality: {data_quality.title()}")
-                st.write(f"• Accounts Analyzed: {account_count}")
-                st.write(f"• Total Posts: {len(all_posts)}")
-                st.write(f"• Confidence Level: {confidence:.1%}")
-                
-                # Methodology explanation
-                with st.expander("View Analysis Methodology"):
-                    st.write("**Analysis Method:**")
-                    st.write("• TextBlob polarity analysis (60% weight)")
-                    st.write("• VADER sentiment intensity (40% weight)")
-                    st.write("• Account-specific categorization")
-                    st.write("• Confidence based on consistency")
-                    st.write("• Market impact interpretation")
-                    
-                    if combined_sentiment_data.get('reasoning'):
-                        st.write("**Analysis Summary:**")
-                        st.write(combined_sentiment_data['reasoning'])
-                
-            # Sentiment timeline if posts have timestamps
-            if all_posts and any(post.get('timestamp', '') != 'unknown' for post in all_posts):
-                st.markdown("**📈 Sentiment Timeline**")
-                try:
-                    timeline_data = []
-                    for post in all_posts:
-                        if post.get('timestamp', '') != 'unknown':
-                            timeline_data.append({
-                                'Time': post['timestamp'],
-                                'Sentiment': post.get('combined_score', 0),
-                                'Account': post.get('username', 'Unknown')
-                            })
-                    
-                    if timeline_data:
-                        timeline_df = pd.DataFrame(timeline_data)
-                        st.line_chart(timeline_df.set_index('Time')['Sentiment'])
-                except Exception as e:
-                    st.info("Timeline chart unavailable - timestamp formatting issue")
-                    st.write("**Signal Interpretation:**")
-                    st.write("• > +0.3: Strong bullish sentiment")
-                    st.write("• +0.1 to +0.3: Weak bullish sentiment")
-                    st.write("• -0.1 to +0.1: Neutral sentiment")
-                    st.write("• -0.3 to -0.1: Weak bearish sentiment")
-                    st.write("• < -0.3: Strong bearish sentiment")
-    
-    else:
-        st.info("📭 No sentiment data available for this simulation period.")
-        st.markdown("""
-        **Note:** Sentiment analysis tracks social media posts from influential accounts:
-        - 🚀 **Elon Musk** (@elonmusk) - High crypto market influence (60% weight)
-        - 🇺🇸 **Donald Trump** (@realdonaldtrump) - Economic/market influence (40% weight)
-        
-        Posts are analyzed for market-relevant sentiment and incorporated into trading decisions.
-        """)
 
 def save_results_to_db(summary, df, symbol, start_date, end_date, interval):
     """Save simulation results to database"""
@@ -2197,9 +1676,6 @@ def save_results_to_db(summary, df, symbol, start_date, end_date, interval):
         logger.error(f"Error saving results: {e}")
         st.warning("Could not save results to database")
 
-# The duplicate fetch_binance_ta function was removed from here.
-# The function is defined earlier in the file (around line 196)
-
 # ── LANGCHAIN AGENTS AND TOOLS ────────────────────────────────────────────────────
 # Define the TechnicalAnalysisTool first (used by MarketAnalystAgent)
 class TechnicalAnalysisTool(BaseTool):
@@ -2217,7 +1693,7 @@ class TechnicalAnalysisTool(BaseTool):
             timestamp = pd.to_datetime(timestamp_str)
             
             # Find the closest timestamp in the dataframe
-            closest_idx = self.df.index.get_indexer([timestamp], method='nearest')[0]
+            closest_idx = resolve_bar_index(self.df.index, timestamp)
             data = self.df.iloc[closest_idx]
             
             # Format response
@@ -2238,11 +1714,65 @@ class TechnicalAnalysisTool(BaseTool):
         except Exception as e:
             return f"Error analyzing data: {str(e)}"
 
+# ── LLM-FREE SUPPORT AGENT OUTPUTS ──────────────────────────────────────────
+# USE_LLM_DECISIONS=false has to mean "no model call anywhere", not "no model
+# call in the decision agent". Until 2026-09-11 it gated only
+# TradingDecisionAgent while the market, pattern and risk agents still invoked
+# the model on every bar -- about 570 calls and ~47 minutes per run -- so the
+# paper's LLM-free baseline was neither LLM-free nor reproducible.
+#
+# The risk agent was the one that actually mattered: its risk_level drives
+# confidence_multiplier = {"low": 1.2, "high": 0.8}, and with moderate-mode
+# min_confidence=0.65 a "high" reading drops a net_signal of 2 from 0.80 to
+# 0.64, turning a BUY into a HOLD. One LLM word could therefore flip a trade in
+# the arm that was supposed to contain no LLM at all.
+#
+# When the LLM is off these agents are ABSENT, not silent, so the neutral
+# values below are the honest representation: "medium" is the only risk level
+# whose multiplier is 1.0, i.e. it applies no tilt. Nothing here is tuned.
+LLM_DISABLED_MARKET_ANALYSIS = (
+    "Market analyst agent disabled for this run (USE_LLM_DECISIONS=false)."
+)
+LLM_DISABLED_PATTERN_ANALYSIS = (
+    "Pattern recognition agent disabled for this run (USE_LLM_DECISIONS=false)."
+)
+
+
+def llm_disabled_risk(volatility_pct: float = None) -> dict:
+    """Neutral risk assessment used when the LLM is switched off.
+
+    `risk_level="medium"` is deliberate: it is the only value that leaves the
+    confidence multiplier at 1.0, so disabling the LLM removes its influence
+    instead of replacing it with a different constant tilt. Volatility is still
+    reported because it is computed from price data and needs no model.
+    """
+    return {
+        "risk_level": "medium",
+        "position_size_pct": 25.0,
+        "stop_loss_price": None,
+        "take_profit_price": None,
+        "risk_reward_ratio": None,
+        "volatility_pct": volatility_pct,
+        "reasoning": "Risk agent disabled (USE_LLM_DECISIONS=false); "
+                     "neutral assessment applied, no confidence tilt.",
+        "source": "llm_disabled",
+    }
+
+
 class MarketAnalystAgent:
     """LangChain-based market analyst agent"""
-    
+
     def __init__(self, df: pd.DataFrame):
         self.df = df
+        self.use_llm = USE_LLM_DECISIONS
+        if not self.use_llm:
+            # Deliberately do not call get_llm(): the rules-only arm must run
+            # with no provider configured at all, which is also what makes it
+            # cheap enough to repeat across windows.
+            self.llm = None
+            self.technical_tool = None
+            self.agent_executor = None
+            return
         self.llm = get_llm()
         self.technical_tool = TechnicalAnalysisTool(df)
         
@@ -2283,11 +1813,13 @@ class MarketAnalystAgent:
     
     def analyze(self, timestamp) -> str:
         """Run the market analyst agent"""
+        if not self.use_llm:
+            return LLM_DISABLED_MARKET_ANALYSIS
         response = self.agent_executor.invoke({
             "input": f"Analyze the market at timestamp {timestamp}. Focus on key indicators and technical signals.",
             "chat_history": []
         })
-        
+
         return response["output"]
 
 class PatternRecognitionAgent:
@@ -2295,8 +1827,13 @@ class PatternRecognitionAgent:
     
     def __init__(self, df: pd.DataFrame):
         self.df = df
+        self.use_llm = USE_LLM_DECISIONS
+        if not self.use_llm:
+            self.llm = None
+            self.agent_executor = None
+            return
         self.llm = get_llm()
-        
+
         # Create agent prompt for pattern recognition
         self.prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content="""
@@ -2328,10 +1865,12 @@ class PatternRecognitionAgent:
     
     def identify_patterns(self, timestamp) -> str:
         """Identify patterns around the given timestamp"""
+        if not self.use_llm:
+            return LLM_DISABLED_PATTERN_ANALYSIS
         try:
             # Get a relevant window of data (20 periods before timestamp)
             timestamp_dt = pd.to_datetime(timestamp)
-            closest_idx = self.df.index.get_indexer([timestamp_dt], method='nearest')[0]
+            closest_idx = resolve_bar_index(self.df.index, timestamp_dt)
             
             window_start = max(0, closest_idx - 20)
             window_end = closest_idx + 1
@@ -2382,8 +1921,14 @@ class RiskManagementAgent:
     def __init__(self, df: pd.DataFrame, config: TradingConfig):
         self.df = df
         self.config = config
+        self.use_llm = USE_LLM_DECISIONS
+        if not self.use_llm:
+            self.llm = None
+            self.agent_executor = None
+            self.structured_llm = None
+            return
         self.llm = get_llm()
-        
+
         # Create risk management prompt
         self.prompt = ChatPromptTemplate.from_messages([
             SystemMessage(content=f"""
@@ -2413,13 +1958,21 @@ class RiskManagementAgent:
         
         # Create the agent executor (without tools for now)
         self.agent_executor = self.llm
-    
+
+        # Structured channel so the model's risk_level actually reaches the
+        # decision agent instead of being flattened to a hardcoded "medium".
+        try:
+            self.structured_llm = self.llm.with_structured_output(LLMRiskAssessment)
+        except Exception as e:
+            logger.error(f"Risk agent structured output unavailable: {e}")
+            self.structured_llm = None
+
     def assess_risk(self, timestamp, action: TradingAction = None, portfolio: dict = None, last_decision=None) -> dict:
         """Assess risk for a potential trade"""
         try:
             # Get relevant window of data (20 periods before timestamp)
             timestamp_dt = pd.to_datetime(timestamp)
-            idx = self.df.index.get_indexer([timestamp_dt], method='nearest')[0]
+            idx = resolve_bar_index(self.df.index, timestamp_dt)
             
             window_start = max(0, idx - 20)
             window_end = idx + 1
@@ -2427,7 +1980,12 @@ class RiskManagementAgent:
             
             # Calculate recent volatility
             volatility = window_df['close'].pct_change().std() * 100
-            
+
+            # Volatility is computed above because it needs no model; the rest
+            # of this method is entirely LLM work, so stop here when it is off.
+            if not self.use_llm:
+                return llm_disabled_risk(float(volatility))
+
             # Current price and indicators
             current_data = window_df.iloc[-1]
             current_price = current_data['close']
@@ -2471,26 +2029,44 @@ class RiskManagementAgent:
             5. Risk-to-reward ratio
             """
             
-            # Invoke LLM for analysis
+            # PHASE 1 FIX: the LLM's answer is now PARSED, not discarded.
+            # Previously this method called the model and then returned a dict of
+            # hardcoded defaults with risk_level pinned to "medium", so the only
+            # channel from the LLM to a trade was permanently dead.
             messages = [
-                SystemMessage(content="You are a risk management specialist for trading operations."),
+                SystemMessage(content=(
+                    "You are a risk management specialist for trading operations. "
+                    "Assess risk conservatively; capital preservation comes first."
+                )),
                 HumanMessage(content=prompt)
             ]
-            
-            response = self.llm.invoke(messages)
-            
-            # Extract response and try to parse into structured format
-            # This is a simplified parser, in production we'd use more robust extraction
-            result = {
-                "risk_level": "medium",  # Default
-                "position_size_pct": 5.0,  # Default
-                "stop_loss_price": current_price * (1 - self.config.stop_loss_pct / 100),
-                "take_profit_price": current_price * (1 + self.config.take_profit_pct / 100),
-                "risk_reward_ratio": 2.0,  # Default
-                "reasoning": response.content
+
+            structured = self.structured_llm.invoke(messages) if self.structured_llm else None
+
+            if structured is None:
+                raise RuntimeError("Structured risk output unavailable")
+
+            level = str(structured.risk_level).strip().lower()
+            if level not in ("low", "medium", "high"):
+                level = "medium"
+
+            # Position size is advisory, so clamp it into a sane band rather
+            # than trusting the model with unbounded leverage.
+            size = float(structured.position_size_pct or 5.0)
+            size = max(1.0, min(100.0, size))
+
+            return {
+                "risk_level": level,
+                "position_size_pct": size,
+                "stop_loss_price": float(structured.stop_loss_price) if structured.stop_loss_price
+                                   else current_price * (1 - self.config.stop_loss_pct),
+                "take_profit_price": float(structured.take_profit_price) if structured.take_profit_price
+                                     else current_price * (1 + self.config.take_profit_pct),
+                "risk_reward_ratio": float(structured.risk_reward_ratio or 2.0),
+                "volatility_pct": float(volatility),
+                "reasoning": str(structured.reasoning or ""),
+                "source": "llm",
             }
-            
-            return result
             
         except Exception as e:
             logger.error(f"Risk assessment error: {e}")
@@ -2500,177 +2076,468 @@ class RiskManagementAgent:
                 "stop_loss_price": None,
                 "take_profit_price": None,
                 "risk_reward_ratio": None,
-                "reasoning": f"Error in risk assessment: {str(e)}"
+                "reasoning": f"Error in risk assessment: {str(e)}",
+                # Marked so a run can report how many risk calls actually
+                # reached the model rather than silently using the fallback.
+                "source": "fallback",
             }
 
+
 class TradingDecisionAgent:
-    """Final decision maker integrating all agent inputs"""
-    
+    """Final decision maker: rule engine proposes, LLM adjusts within bounds.
+
+    Design rationale for the paper. A rule engine alone is deterministic but
+    blind to context; an LLM alone is unbounded and unauditable. Here the rules
+    produce a signal score, the LLM returns a clamped integer adjustment plus an
+    optional risk veto, and the same threshold logic maps both the pre- and
+    post-adjustment score to an action. That yields a per-decision measurement
+    of exactly what the model contributed.
+    """
+
     def __init__(self, df: pd.DataFrame, config: TradingConfig):
         self.df = df
         self.config = config
-        self.llm = get_llm()
-    
-    def make_decision(self, timestamp, market_analysis: str, pattern_analysis: str, 
-                     risk_assessment: dict, portfolio: dict, last_decision=None) -> TradingDecision:
-        """Integrate all analyses and make a trading decision"""
+        self.use_llm = USE_LLM_DECISIONS
+        # Only build a provider client when one will actually be used, so the
+        # rules-only arm runs with no API key configured at all.
+        self.llm = get_llm() if self.use_llm else None
+        self.structured_llm = None
+        if self.use_llm:
+            try:
+                self.structured_llm = self.llm.with_structured_output(LLMTradeAdjustment)
+            except Exception as e:
+                logger.error(f"Structured output unavailable, falling back to rules only: {e}")
+                self.use_llm = False
+        # Aggregate telemetry across the whole run
+        self.stats = {
+            "decisions": 0, "llm_calls": 0, "llm_failures": 0,
+            "changed": 0, "vetoes": 0, "total_latency_s": 0.0,
+        }
+
+    # ── Rule engine (unchanged logic, now isolated as the baseline arm) ──
+    def _compute_rule_signals(self, idx: int, current_data, current_price: float,
+                              positioning=None, text_sentiment=None) -> dict:
+        """Technical rule score, optionally plus the exogenous positioning score.
+
+        PHASE 3: positioning enters the RULE engine, not only the LLM prompt.
+        That distinction is what makes the ablation identifiable: if the signal
+        reached the decision solely through the prompt, then in the
+        USE_LLM_DECISIONS=false arm it would contribute nothing, and "positioning
+        adds information" could not be separated from "the LLM adds information".
+        """
+        rsi = current_data['RSI']
+        ma20 = current_data['MA20']
+        ma50 = current_data['MA50']
+        macd_hist = current_data['MACD_hist']
+        macd_line = current_data['MACD_line']
+        macd_signal = current_data['MACD_signal']
+
+        bullish_signals = 0
+        bearish_signals = 0
+        signal_details = []
+
+        # RSI Analysis
+        if rsi < 30:
+            bullish_signals += 2
+            signal_details.append(f"RSI oversold ({rsi:.1f})")
+        elif rsi > 70:
+            bearish_signals += 2
+            signal_details.append(f"RSI overbought ({rsi:.1f})")
+        elif rsi < 40:
+            bullish_signals += 1
+            signal_details.append(f"RSI bullish ({rsi:.1f})")
+        elif rsi > 60:
+            bearish_signals += 1
+            signal_details.append(f"RSI bearish ({rsi:.1f})")
+
+        # Moving Average Analysis
+        if current_price > ma20 > ma50:
+            bullish_signals += 2
+            signal_details.append("Price above MA20 & MA50 (uptrend)")
+        elif current_price > ma20:
+            bullish_signals += 1
+            signal_details.append("Price above MA20")
+        elif current_price < ma20 < ma50:
+            bearish_signals += 2
+            signal_details.append("Price below MA20 & MA50 (downtrend)")
+        elif current_price < ma20:
+            bearish_signals += 1
+            signal_details.append("Price below MA20")
+
+        # MACD Analysis
+        if macd_line > macd_signal and macd_hist > 0:
+            bullish_signals += 1
+            signal_details.append("MACD bullish crossover")
+        elif macd_line < macd_signal and macd_hist < 0:
+            bearish_signals += 1
+            signal_details.append("MACD bearish crossover")
+
+        # Momentum
+        momentum = 0.0
+        if idx >= 5:
+            price_5_ago = self.df.iloc[idx - 5]['close']
+            momentum = (current_price - price_5_ago) / price_5_ago
+            if momentum > 0.02:
+                bullish_signals += 1
+                signal_details.append(f"Strong momentum (+{momentum*100:.1f}%)")
+            elif momentum < -0.02:
+                bearish_signals += 1
+                signal_details.append(f"Negative momentum ({momentum*100:.1f}%)")
+
+        # Positioning (exogenous, non-price). Contributes only when the flag is
+        # on AND a real point-in-time reading exists. A missing reading adds
+        # nothing; it is never treated as a neutral measurement.
+        pos_points = 0
+        pos_score = None
+        if positioning is not None and getattr(positioning, "available", False):
+            pos_score = float(positioning.score)
+            bullish_signals += int(positioning.bullish_points)
+            bearish_signals += int(positioning.bearish_points)
+            pos_points = int(positioning.bullish_points) - int(positioning.bearish_points)
+            if pos_points:
+                direction = "bullish" if pos_points > 0 else "bearish"
+                signal_details.append(
+                    f"Futures positioning {direction} ({pos_score:+.2f})"
+                )
+
+        # Text sentiment (exogenous, non-price). Same contract as positioning:
+        # contributes only when a real point-in-time reading exists, and a
+        # missing reading adds nothing rather than voting neutral.
+        text_points = 0
+        text_score = None
+        if text_sentiment is not None and getattr(text_sentiment, "available", False):
+            text_score = float(text_sentiment.score)
+            bullish_signals += int(text_sentiment.bullish_points)
+            bearish_signals += int(text_sentiment.bearish_points)
+            text_points = (int(text_sentiment.bullish_points)
+                           - int(text_sentiment.bearish_points))
+            if text_points:
+                direction = "bullish" if text_points > 0 else "bearish"
+                signal_details.append(
+                    f"Text sentiment {direction} ({text_score:+.2f}, "
+                    f"{text_sentiment.doc_count} docs)"
+                )
+
+        return {
+            "bullish": bullish_signals,
+            "bearish": bearish_signals,
+            "net_signal": bullish_signals - bearish_signals,
+            "details": signal_details,
+            "rsi": rsi, "ma20": ma20, "ma50": ma50,
+            "macd_hist": macd_hist, "momentum": momentum,
+            "positioning_score": pos_score,
+            "positioning_points": pos_points,
+            "text_sentiment_score": text_score,
+            "text_sentiment_points": text_points,
+        }
+
+    def _signal_to_action(self, net_signal: int, sig: dict, portfolio: dict,
+                          current_price: float, confidence_multiplier: float) -> tuple:
+        """Map a signal score to (action, confidence, reasoning).
+
+        Called twice per decision: once on the rule score to establish the
+        baseline, once on the adjusted score to get the final action.
+        """
+        rsi = sig["rsi"]
+        ma20 = sig["ma20"]
+        bullish_signals = sig["bullish"]
+        bearish_signals = sig["bearish"]
+        signal_details = sig["details"]
+
+        action = TradingAction.HOLD
+        confidence = 0.6
+        reasoning = "Default HOLD position"
+
+        if net_signal >= self.config.signal_threshold and not portfolio['holding']:
+            action = TradingAction.BUY
+            confidence = min(0.9, 0.6 + (net_signal * 0.1)) * confidence_multiplier
+            reasoning = f"BUY Signal: {bullish_signals} bullish vs {bearish_signals} bearish signals. Details: {', '.join(signal_details)}"
+
+        elif net_signal <= -self.config.signal_threshold and portfolio['holding']:
+            action = TradingAction.SELL
+            confidence = min(0.9, 0.6 + (abs(net_signal) * 0.1)) * confidence_multiplier
+            reasoning = f"SELL Signal: {bearish_signals} bearish vs {bullish_signals} bullish signals. Details: {', '.join(signal_details)}"
+
+        elif portfolio['holding']:
+            if rsi > 75:
+                action = TradingAction.SELL
+                confidence = 0.8 * confidence_multiplier
+                reasoning = f"SELL: RSI extremely overbought ({rsi:.1f}). Risk management."
+            elif portfolio.get('entry_price', 0) > 0:
+                loss_pct = (current_price - portfolio['entry_price']) / portfolio['entry_price']
+                if loss_pct < -self.config.stop_loss_pct:
+                    action = TradingAction.SELL
+                    confidence = 0.9
+                    reasoning = f"SELL: Stop loss triggered. Loss: {loss_pct*100:.1f}%"
+                elif loss_pct > self.config.take_profit_pct:
+                    action = TradingAction.SELL
+                    confidence = 0.8
+                    reasoning = f"SELL: Take profit triggered. Gain: {loss_pct*100:.1f}%"
+
+        elif not portfolio['holding']:
+            if rsi < self.config.rsi_oversold + 5 and current_price > ma20:
+                action = TradingAction.BUY
+                confidence = 0.8 * confidence_multiplier
+                reasoning = f"BUY: Oversold in uptrend. RSI: {rsi:.1f}, Price > MA20"
+            elif self.config.trading_mode == "aggressive" and bullish_signals >= 1:
+                action = TradingAction.BUY
+                confidence = 0.7 * confidence_multiplier
+                reasoning = f"BUY: Aggressive mode - bullish momentum. Signals: {bullish_signals}"
+
+        # Minimum-confidence gate. (Bug fix: the original formatted the message
+        # after overwriting `confidence`, so it always printed 0.70.)
+        if action != TradingAction.HOLD and confidence < self.config.min_confidence:
+            rejected_confidence = confidence
+            action = TradingAction.HOLD
+            confidence = 0.7
+            reasoning = (f"HOLD: Trade signal present but confidence {rejected_confidence:.2f} "
+                         f"below minimum {self.config.min_confidence}")
+
+        if action == TradingAction.HOLD and signal_details:
+            reasoning = (f"HOLD: Net signal {net_signal} (bullish: {bullish_signals}, "
+                         f"bearish: {bearish_signals}). Details: {', '.join(signal_details[:3])}")
+
+        return action, confidence, reasoning
+
+    def _build_llm_context(self, timestamp, sig: dict, current_price: float,
+                           rule_action: TradingAction, market_analysis: str,
+                           pattern_analysis: str, risk_assessment: dict,
+                           portfolio: dict, dl_prediction: dict,
+                           vector_insights: dict, positioning=None,
+                           text_sentiment=None) -> str:
+        """Assemble every agent's output into one decision prompt."""
+        def clip(text, n=700):
+            if not text:
+                return "not available"
+            text = str(text).strip()
+            return text if len(text) <= n else text[:n] + "..."
+
+        # Already counted in the rule score, so say so: otherwise the model
+        # double-counts it as both the baseline and fresh evidence.
+        text_line = "not available"
+        if text_sentiment is not None and getattr(text_sentiment, "available", False):
+            text_line = (
+                f"score {text_sentiment.score:+.3f} (positive = bullish), "
+                f"confidence {text_sentiment.confidence:.2f}, "
+                f"{text_sentiment.doc_count} documents, "
+                f"already worth {sig.get('text_sentiment_points', 0):+d} point(s) in "
+                f"the rule score above. {text_sentiment.reasoning}"
+            )
+        elif text_sentiment is not None:
+            text_line = f"not available ({text_sentiment.reasoning})"
+
+        # Positioning is already counted in the rule score above, so the prompt
+        # says so explicitly. Otherwise the model double-counts it: once as the
+        # baseline it is adjusting, and again as fresh evidence.
+        pos_line = "not available"
+        if positioning is not None and getattr(positioning, "available", False):
+            pos_line = (
+                f"score {positioning.score:+.3f} (positive = bullish), "
+                f"confidence {positioning.confidence:.2f}, "
+                f"already worth {sig.get('positioning_points', 0):+d} point(s) in the "
+                f"rule score above. {positioning.reasoning}"
+            )
+        elif positioning is not None:
+            pos_line = f"not available ({positioning.reasoning})"
+
+        dl_line = "not available"
+        if dl_prediction:
+            dl_line = (f"signal {dl_prediction.get('signal', 'n/a')}, "
+                       f"confidence {dl_prediction.get('confidence', 0):.2f}")
+
+        vec_line = "not available"
+        if vector_insights:
+            vec_line = clip(json.dumps(vector_insights, default=str), 300)
+
+        position = "FLAT (no open position)"
+        if portfolio.get('holding'):
+            entry = portfolio.get('entry_price', 0)
+            pnl = ((current_price - entry) / entry * 100) if entry else 0.0
+            position = f"LONG from ${entry:.2f}, unrealised P&L {pnl:+.2f}%"
+
+        return f"""Trading decision review for {timestamp}.
+
+CURRENT MARKET STATE
+- Price: ${current_price:.2f}
+- RSI: {sig['rsi']:.1f}
+- MA20: ${sig['ma20']:.2f} | MA50: ${sig['ma50']:.2f}
+- MACD histogram: {sig['macd_hist']:.4f}
+- 5-bar momentum: {sig['momentum']*100:+.2f}%
+
+RULE ENGINE OUTPUT (the baseline you are adjusting)
+- Bullish points: {sig['bullish']} | Bearish points: {sig['bearish']}
+- Net signal score: {sig['net_signal']}
+- Signal threshold for action: {self.config.signal_threshold}
+- Rule engine would: {rule_action.value}
+- Triggered rules: {', '.join(sig['details']) if sig['details'] else 'none'}
+
+PORTFOLIO
+- {position}
+- Cash: ${portfolio.get('cash', 0):.2f}
+- Strategy mode: {self.config.trading_mode}
+
+MARKET ANALYST AGENT
+{clip(market_analysis)}
+
+PATTERN RECOGNITION AGENT
+{clip(pattern_analysis)}
+
+RISK AGENT
+- Assessed level: {risk_assessment.get('risk_level', 'unknown')}
+- Notes: {clip(risk_assessment.get('reasoning'), 400)}
+
+FUTURES POSITIONING AGENT (Binance USD-M perpetuals, point-in-time)
+- {pos_line}
+
+TEXT SENTIMENT AGENT (Hacker News posts and comments, point-in-time)
+- {text_line}
+
+DEEP LEARNING AGENT: {dl_line}
+SIMILAR HISTORICAL PATTERNS: {vec_line}
+
+YOUR TASK
+Return a bounded adjustment to the net signal score of {sig['net_signal']}.
+- signal_adjustment must be an integer in [-{LLM_MAX_ADJUSTMENT}, +{LLM_MAX_ADJUSTMENT}].
+- Use 0 when the agent inputs add nothing beyond what the rules already capture.
+- Set veto=true ONLY to block a trade on clear risk grounds.
+- Every entry in key_factors must cite a specific input above, not generic advice.
+Be conservative: the rules are a reasonable baseline, so only move the score when
+the qualitative agent inputs genuinely justify it."""
+
+    def _query_llm(self, prompt: str) -> tuple:
+        """Return (LLMTradeAdjustment or None, error string, latency seconds)."""
+        started = time.time()
         try:
-            # Get price data at timestamp
+            system = SystemMessage(content=(
+                "You are the final arbiter in a multi-agent crypto trading system. "
+                "You receive a rule-based signal score and qualitative analysis from "
+                "specialist agents, and you return a small, bounded correction to that "
+                "score. You are not a cheerleader: returning 0 is the correct answer "
+                "whenever the qualitative inputs do not add information."
+            ))
+            result = self.structured_llm.invoke([system, HumanMessage(content=prompt)])
+            return result, "", time.time() - started
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}", time.time() - started
+
+    def make_decision(self, timestamp, market_analysis: str, pattern_analysis: str,
+                      risk_assessment: dict, portfolio: dict, last_decision=None,
+                      dl_prediction: dict = None,
+                      vector_insights: dict = None, positioning=None,
+                      text_sentiment=None) -> TradingDecision:
+        """Integrate all analyses and make a trading decision."""
+        current_price = 0.0
+        try:
             timestamp_dt = pd.to_datetime(timestamp)
-            idx = self.df.index.get_indexer([timestamp_dt], method='nearest')[0]
+            idx = resolve_bar_index(self.df.index, timestamp_dt)
             current_data = self.df.iloc[idx]
             current_price = current_data['close']
-            
-            # Technical indicators
-            rsi = current_data['RSI']
-            ma20 = current_data['MA20']
-            ma50 = current_data['MA50']
-            macd_hist = current_data['MACD_hist']
-            macd_line = current_data['MACD_line']
-            macd_signal = current_data['MACD_signal']
-            
-            # Default action is HOLD
-            action = TradingAction.HOLD
-            confidence = 0.6
-            reasoning = "Default HOLD position"
-            
-            # Enhanced technical analysis decision logic
-            bullish_signals = 0
-            bearish_signals = 0
-            signal_details = []
-            
-            # RSI Analysis
-            if rsi < 30:  # Oversold
-                bullish_signals += 2
-                signal_details.append(f"RSI oversold ({rsi:.1f})")
-            elif rsi > 70:  # Overbought
-                bearish_signals += 2
-                signal_details.append(f"RSI overbought ({rsi:.1f})")
-            elif rsi < 40:  # Approaching oversold
-                bullish_signals += 1
-                signal_details.append(f"RSI bullish ({rsi:.1f})")
-            elif rsi > 60:  # Approaching overbought
-                bearish_signals += 1
-                signal_details.append(f"RSI bearish ({rsi:.1f})")
-            
-            # Moving Average Analysis
-            if current_price > ma20 > ma50:  # Strong uptrend
-                bullish_signals += 2
-                signal_details.append("Price above MA20 & MA50 (uptrend)")
-            elif current_price > ma20:  # Price above short MA
-                bullish_signals += 1
-                signal_details.append("Price above MA20")
-            elif current_price < ma20 < ma50:  # Strong downtrend
-                bearish_signals += 2
-                signal_details.append("Price below MA20 & MA50 (downtrend)")
-            elif current_price < ma20:  # Price below short MA
-                bearish_signals += 1
-                signal_details.append("Price below MA20")
-            
-            # MACD Analysis
-            if macd_line > macd_signal and macd_hist > 0:  # MACD bullish
-                bullish_signals += 1
-                signal_details.append("MACD bullish crossover")
-            elif macd_line < macd_signal and macd_hist < 0:  # MACD bearish
-                bearish_signals += 1
-                signal_details.append("MACD bearish crossover")
-            
-            # Volume and momentum check (using recent price changes)
-            if idx >= 5:
-                price_5_ago = self.df.iloc[idx - 5]['close']
-                momentum = (current_price - price_5_ago) / price_5_ago
-                
-                if momentum > 0.02:  # Strong positive momentum
-                    bullish_signals += 1
-                    signal_details.append(f"Strong momentum (+{momentum*100:.1f}%)")
-                elif momentum < -0.02:  # Strong negative momentum
-                    bearish_signals += 1
-                    signal_details.append(f"Negative momentum ({momentum*100:.1f}%)")
-            
-            # Risk assessment integration
-            risk_level = risk_assessment.get('risk_level', 'medium')
-            if risk_level == 'low':
-                confidence_multiplier = 1.2
-            elif risk_level == 'high':
-                confidence_multiplier = 0.8
-            else:
-                confidence_multiplier = 1.0
-            
-            # Decision logic based on signals
-            net_signal = bullish_signals - bearish_signals
-            
-            # BUY decision - use signal threshold from config
-            if net_signal >= self.config.signal_threshold and not portfolio['holding']:
-                action = TradingAction.BUY
-                confidence = min(0.9, 0.6 + (net_signal * 0.1)) * confidence_multiplier
-                reasoning = f"BUY Signal: {bullish_signals} bullish vs {bearish_signals} bearish signals. Details: {', '.join(signal_details)}"
-            
-            # SELL decision - use signal threshold from config
-            elif net_signal <= -self.config.signal_threshold and portfolio['holding']:
-                action = TradingAction.SELL
-                confidence = min(0.9, 0.6 + (abs(net_signal) * 0.1)) * confidence_multiplier
-                reasoning = f"SELL Signal: {bearish_signals} bearish vs {bullish_signals} bullish signals. Details: {', '.join(signal_details)}"
-            
-            # Additional selling conditions if holding
-            elif portfolio['holding']:
-                # Sell if RSI is very overbought
-                if rsi > 75:
-                    action = TradingAction.SELL
-                    confidence = 0.8 * confidence_multiplier
-                    reasoning = f"SELL: RSI extremely overbought ({rsi:.1f}). Risk management."
-                
-                # Sell if significant loss (stop loss)
-                elif portfolio.get('entry_price', 0) > 0:
-                    loss_pct = (current_price - portfolio['entry_price']) / portfolio['entry_price']
-                    if loss_pct < -self.config.stop_loss_pct:  # Use config stop loss
-                        action = TradingAction.SELL
-                        confidence = 0.9
-                        reasoning = f"SELL: Stop loss triggered. Loss: {loss_pct*100:.1f}%"
-                    elif loss_pct > self.config.take_profit_pct:  # Use config take profit
-                        action = TradingAction.SELL
-                        confidence = 0.8
-                        reasoning = f"SELL: Take profit triggered. Gain: {loss_pct*100:.1f}%"
-            
-            # Additional buying conditions if not holding (more aggressive)
-            elif not portfolio['holding']:
-                # Strong buy signal on oversold + uptrend
-                if rsi < self.config.rsi_oversold + 5 and current_price > ma20:
-                    action = TradingAction.BUY
-                    confidence = 0.8 * confidence_multiplier
-                    reasoning = f"BUY: Oversold in uptrend. RSI: {rsi:.1f}, Price > MA20"
-                # Bullish momentum trade (for aggressive mode)
-                elif self.config.trading_mode == "aggressive" and bullish_signals >= 1:
-                    action = TradingAction.BUY
-                    confidence = 0.7 * confidence_multiplier
-                    reasoning = f"BUY: Aggressive mode - bullish momentum. Signals: {bullish_signals}"
-            
-            # Ensure minimum confidence for trades
-            if action != TradingAction.HOLD and confidence < self.config.min_confidence:
-                action = TradingAction.HOLD
-                confidence = 0.7
-                reasoning = f"HOLD: Trade signal present but confidence {confidence:.2f} below minimum {self.config.min_confidence}"
-            
-            # Final reasoning with all details
-            if action == TradingAction.HOLD and signal_details:
-                reasoning = f"HOLD: Net signal {net_signal} (bullish: {bullish_signals}, bearish: {bearish_signals}). Details: {', '.join(signal_details[:3])}"
-            
-            # Create trading decision
-            return TradingDecision(
-                action=action,
-                confidence=confidence,
-                reasoning=reasoning,
-                price=current_price,
-                timestamp=timestamp
+
+            sig = self._compute_rule_signals(
+                idx, current_data, current_price, positioning=positioning,
+                text_sentiment=text_sentiment,
             )
-            
+
+            # Risk level now genuinely comes from the risk agent's parsed output
+            risk_level = risk_assessment.get('risk_level', 'medium')
+            confidence_multiplier = {"low": 1.2, "high": 0.8}.get(risk_level, 1.0)
+
+            # 1. Baseline: what the rules alone would do
+            rule_action, rule_conf, rule_reason = self._signal_to_action(
+                sig["net_signal"], sig, portfolio, current_price, confidence_multiplier
+            )
+
+            contrib = LLMContribution(
+                rule_action=rule_action.value,
+                final_action=rule_action.value,
+                rule_signal=sig["net_signal"],
+                key_factors=[],
+            )
+            self.stats["decisions"] += 1
+
+            # 2. Rules-only ablation arm stops here
+            if not self.use_llm or self.structured_llm is None:
+                return TradingDecision(
+                    action=rule_action, confidence=rule_conf,
+                    reasoning=rule_reason, price=current_price, timestamp=timestamp,
+                    rule_action=rule_action.value, llm=contrib.to_dict(),
+                )
+
+            # 3. Ask the LLM for a bounded adjustment
+            prompt = self._build_llm_context(
+                timestamp, sig, current_price, rule_action, market_analysis,
+                pattern_analysis, risk_assessment, portfolio,
+                dl_prediction, vector_insights, positioning,
+                text_sentiment,
+            )
+            adjustment, error, latency = self._query_llm(prompt)
+            contrib.invoked = True
+            contrib.latency_s = latency
+            self.stats["llm_calls"] += 1
+            self.stats["total_latency_s"] += latency
+
+            if adjustment is None:
+                # Fail safe: the rule decision stands, and the failure is recorded
+                # rather than hidden, so runs with degraded LLM coverage are visible.
+                contrib.error = error
+                self.stats["llm_failures"] += 1
+                logger.warning(f"LLM decision call failed at {timestamp}: {error}")
+                return TradingDecision(
+                    action=rule_action, confidence=rule_conf,
+                    reasoning=f"{rule_reason} [LLM unavailable: {error}]",
+                    price=current_price, timestamp=timestamp,
+                    rule_action=rule_action.value, llm=contrib.to_dict(),
+                )
+
+            contrib.succeeded = True
+            raw_adj = int(adjustment.signal_adjustment or 0)
+            clamped = max(-LLM_MAX_ADJUSTMENT, min(LLM_MAX_ADJUSTMENT, raw_adj))
+            contrib.adjustment = clamped
+            contrib.stance = str(adjustment.stance)
+            contrib.veto = bool(adjustment.veto)
+            contrib.confidence = float(adjustment.confidence or 0.0)
+            contrib.key_factors = list(adjustment.key_factors or [])
+            contrib.rationale = str(adjustment.rationale or "")
+
+            # 4. Recompute the action from the adjusted score
+            adjusted_signal = sig["net_signal"] + clamped
+            final_action, final_conf, final_reason = self._signal_to_action(
+                adjusted_signal, sig, portfolio, current_price, confidence_multiplier
+            )
+
+            # 5. Veto can only block a trade, never create one
+            if adjustment.veto and final_action != TradingAction.HOLD:
+                final_action = TradingAction.HOLD
+                final_conf = 0.7
+                final_reason = f"HOLD: LLM risk veto. {contrib.rationale}"
+                self.stats["vetoes"] += 1
+
+            # Blend confidence: rule confidence weighted with the model's own
+            final_conf = min(0.95, 0.7 * final_conf + 0.3 * contrib.confidence)
+
+            contrib.final_action = final_action.value
+            if contrib.changed_decision:
+                self.stats["changed"] += 1
+
+            reasoning = (
+                f"{final_reason} | LLM {contrib.stance} adj {clamped:+d} "
+                f"(score {sig['net_signal']} -> {adjusted_signal}): {contrib.rationale}"
+            )
+
+            return TradingDecision(
+                action=final_action, confidence=final_conf, reasoning=reasoning,
+                price=current_price, timestamp=timestamp,
+                rule_action=rule_action.value, llm=contrib.to_dict(),
+            )
+
         except Exception as e:
             logger.error(f"Decision agent error: {e}")
             return TradingDecision(
                 action=TradingAction.HOLD,
                 confidence=0.9,
                 reasoning=f"Error occurred: {str(e)}. Defaulting to HOLD for safety.",
-                price=current_price if 'current_price' in locals() else 0.0,
-                timestamp=timestamp
+                price=current_price,
+                timestamp=timestamp,
             )
 
 # ── DEEP LEARNING AGENT ────────────────────────────────────────────────────
@@ -2788,7 +2655,7 @@ class DeepLearningAgent:
                 monitor='val_loss', patience=10, restore_best_weights=True
             )
             
-            history = self.model.fit(
+            self.model.fit(
                 X_train, y_train,
                 epochs=100,
                 batch_size=32,
@@ -2871,15 +2738,24 @@ class VectorDBAgent:
     def initialize(self):
         """Initialize the vector database"""
         try:
-            openai_key = os.getenv("OPENAI_API_KEY")
-            if not openai_key:
-                return False
-                
-            # Use a more accessible embedding model
-            self.embeddings = OpenAIEmbeddings(
-                openai_api_key=openai_key,
-                model="text-embedding-3-small"  # More accessible model
-            )
+            if USE_AZURE_OPENAI:
+                # Requires an embedding deployment in the same Foundry resource.
+                self.embeddings = AzureOpenAIEmbeddings(
+                    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+                    api_key=AZURE_OPENAI_API_KEY,
+                    azure_deployment=AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+                    api_version=AZURE_OPENAI_API_VERSION,
+                )
+            else:
+                openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+                if not openai_key:
+                    return False
+
+                # Use a more accessible embedding model
+                self.embeddings = OpenAIEmbeddings(
+                    openai_api_key=openai_key,
+                    model="text-embedding-3-small"  # More accessible model
+                )
             self.initialized = True
             return True
         except Exception as e:
@@ -3011,292 +2887,6 @@ class VectorDBAgent:
             return {"recommendation": "HOLD", "confidence": 0.0, "reasoning": "Error analyzing patterns"}
 
 # ── SENTIMENT ANALYSIS AGENT ──────────────────────────────────────────────
-class SentimentAnalysisAgent:
-    """Agent for scraping Twitter posts from Elon Musk and Donald Trump and analyzing sentiment"""
-    
-    def __init__(self, config: TradingConfig, start_date: datetime = None, end_date: datetime = None):
-        self.config = config
-        self.start_date = start_date
-        self.end_date = end_date
-        self.analyzer = SentimentIntensityAnalyzer() if SENTIMENT_AVAILABLE else None
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        })
-        
-        # Cache for sentiment scores by date
-        self.sentiment_cache = {}
-        self.last_update = None
-        self.cache_duration = 300  # 5 minutes cache
-        
-        # For historical data, we'll use a simulated approach
-        self.is_historical = (start_date and start_date < datetime.now() - dt.timedelta(days=7))
-        
-        # Influential accounts to monitor
-        self.target_accounts = {
-            'elonmusk': {
-                'name': 'Elon Musk',
-                'weight': 0.6,  # Higher weight due to crypto influence
-                'keywords': ['bitcoin', 'btc', 'crypto', 'cryptocurrency', 'doge', 'dogecoin', 'tesla', 'market']
-            },
-            'realdonaldtrump': {
-                'name': 'Donald Trump',
-                'weight': 0.4,  # Market influence weight
-                'keywords': ['market', 'economy', 'trade', 'bitcoin', 'crypto', 'investment', 'money']
-            }
-        }
-        
-    def scrape_twitter_alternative(self, username: str, max_posts: int = 10) -> List[Dict[str, Any]]:
-        """
-        Scrape Twitter and alternative sources for posts from influential accounts
-        Note: This is a simulation for educational purposes. In production, use official APIs.
-        """
-        posts = []
-        
-        try:
-            # Try Twitter API v2 (requires bearer token)
-            bearer_token = os.getenv("TWITTER_BEARER_TOKEN")
-            if bearer_token:
-                headers = {"Authorization": f"Bearer {bearer_token}"}
-                response = requests.get(f"https://api.twitter.com/2/tweets?ids={username}&tweet.fields=created_at,text", headers=headers)
-                
-                if response.status_code == 200:
-                    tweets = response.json().get("data", [])
-                    for tweet in tweets:
-                        posts.append({
-                            'text': tweet['text'],
-                            'username': username,
-                            'timestamp': tweet['created_at'],
-                            'source': 'twitter_api'
-                        })
-                
-                if len(posts) >= max_posts:
-                    return posts  # Enough posts collected
-            
-            # Fallback: Scrape from Twitter web interface (publicly accessible)
-            posts = self.scrape_twitter_web(username, max_posts)
-            
-        except Exception as e:
-            logger.error(f"Error scraping Twitter for {username}: {e}")
-            # Generate simulated posts as fallback
-            posts = self._generate_simulated_posts(username, max_posts)
-        
-        return posts
-    
-    def scrape_twitter_web(self, username: str, max_posts: int = 10) -> List[Dict[str, Any]]:
-        """Scrape Twitter web interface for recent posts from a user"""
-        posts = []
-        
-        try:
-            url = f"https://twitter.com/{username}"
-            response = self.session.get(url, timeout=10)
-            
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Look for tweet content (Twitter structure)
-                tweets = soup.find_all('div', class_='tweet')
-                
-                for tweet in tweets[:max_posts]:
-                    text = tweet.get_text().strip()
-                    if text and len(text) > 20:  # Filter out too short posts
-                        posts.append({
-                            'text': text,
-                            'username': username,
-                            'timestamp': datetime.now(),
-                            'source': 'twitter_web'
-
-                        })
-            
-        except Exception as e:
-            logger.error(f"Error scraping Twitter web for {username}: {e}")
-        
-        return posts
-    
-    def _generate_simulated_posts(self, username: str, max_posts: int, target_date: datetime = None) -> List[Dict[str, Any]]:
-        """Generate simulated posts for testing when scraping fails or for historical dates"""
-        simulated_posts = []
-        
-        # Use target_date if provided, otherwise use current time
-        base_date = target_date if target_date else datetime.now()
-        
-        # Template posts based on typical content from these accounts
-        if username == 'elonmusk':
-            templates = [
-                "The future of cryptocurrency looks promising. Innovation is key.",
-                "Tesla continues to push boundaries in technology and sustainability.",
-                "Interesting developments in the crypto market today.",
-                "Technology will transform how we think about money and investments.",
-                "Mars missions and Bitcoin mining both require significant energy innovation.",
-                "Dogecoin to the moon! 🚀",
-                "Bitcoin is the future of money.",
-                "Crypto adoption is accelerating worldwide.",
-                "Sustainable energy and digital currencies go hand in hand.",
-                "The power of decentralized finance is undeniable."
-            ]
-        else:  # Donald Trump
-            templates = [
-                "The market is doing very well under strong leadership.",
-                "American economy is the strongest it's ever been.",
-                "Great deals being made in trade negotiations.",
-                "Investment opportunities are tremendous right now.",
-                "The stock market continues to reach new heights.",
-                "Our markets are the best in the world!",
-                "Trade deals bringing tremendous benefits.",
-                "Economic growth is phenomenal.",
-                "America First policies creating prosperity.",
-                "Record-breaking market performance!"
-            ]
-        
-        # Generate posts with varied timestamps around the target date
-        for i, template in enumerate(templates[:max_posts]):
-            # Distribute posts over several hours around the target date
-            time_offset = dt.timedelta(hours=np.random.uniform(-12, 12), 
-                                     minutes=np.random.uniform(-30, 30))
-            post_time = base_date + time_offset
-            
-            # Add some sentiment variation based on market volatility simulation
-            sentiment_modifier = ""
-            if np.random.random() > 0.7:  # 30% chance of strong sentiment
-                if np.random.random() > 0.5:
-                    sentiment_modifier = " This is huge! 🔥"
-                else:
-                    sentiment_modifier = " Concerned about recent developments."
-            
-            simulated_posts.append({
-                'text': template + sentiment_modifier,
-                'username': username,
-                'timestamp': post_time,
-                'source': 'simulated'
-            })
-        
-        return simulated_posts
-
-    def analyze_sentiment(self, posts: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Analyze sentiment of collected posts with detailed breakdown"""
-        try:
-            if not posts:
-                return {
-                    'sentiment_score': 0.0,
-                    'confidence': 0.0,
-                    'reasoning': "No posts to analyze",
-                    'data_quality': 'insufficient',
-                    'account_count': 0,
-                    'post_details': [],
-                    'trump_posts': [],
-                    'musk_posts': []
-                }
-            
-            # Analyze sentiment for each post with details
-            post_details = []
-            trump_posts = []
-            musk_posts = []
-            textblob_scores = []
-            vader_scores = []
-            
-            for post in posts:
-                post_analysis = {
-                    'text': post['text'][:100] + "..." if len(post['text']) > 100 else post['text'],
-                    'username': post.get('username', 'unknown'),
-                    'timestamp': post.get('timestamp', 'unknown'),
-                    'textblob_score': 0.0,
-                    'vader_score': 0.0,
-                    'combined_score': 0.0,
-                    'sentiment_label': 'neutral'
-                }
-                
-                # TextBlob analysis
-                if SENTIMENT_AVAILABLE:
-                    blob = TextBlob(post['text'])
-                    textblob_score = blob.sentiment.polarity
-                    
-                    # VADER analysis
-                    analyzer = SentimentIntensityAnalyzer()
-                    vader_score = analyzer.polarity_scores(post['text'])['compound']
-                else:
-                    textblob_score = np.random.uniform(-0.3, 0.3)  # Simulated score
-                    vader_score = np.random.uniform(-0.3, 0.3)
-                
-                # Combined score for this post
-                combined_score = (textblob_score * 0.6) + (vader_score * 0.4)
-                
-                # Sentiment label
-                if combined_score > 0.2:
-                    sentiment_label = "positive"
-                elif combined_score < -0.2:
-                    sentiment_label = "negative"
-                else:
-                    sentiment_label = "neutral"
-                
-                post_analysis.update({
-                    'textblob_score': textblob_score,
-                    'vader_score': vader_score,
-                    'combined_score': combined_score,
-                    'sentiment_label': sentiment_label
-                })
-                
-                post_details.append(post_analysis)
-                textblob_scores.append(textblob_score)
-                vader_scores.append(vader_score)
-                
-                # Categorize by account
-                username = post.get('username', '').lower()
-                if 'trump' in username or 'donald' in username:
-                    trump_posts.append(post_analysis)
-                elif 'musk' in username or 'elon' in username:
-                    musk_posts.append(post_analysis)
-            
-            # Calculate overall sentiment
-            avg_textblob = np.mean(textblob_scores) if textblob_scores else 0.0
-            avg_vader = np.mean(vader_scores) if vader_scores else 0.0
-            combined_score = (avg_textblob * 0.6) + (avg_vader * 0.4)
-            
-            # Calculate confidence based on consistency
-            textblob_std = np.std(textblob_scores) if len(textblob_scores) > 1 else 0.0
-            vader_std = np.std(vader_scores) if len(vader_scores) > 1 else 0.0
-            avg_std = (textblob_std + vader_std) / 2
-            confidence = max(0.1, 1.0 - min(avg_std, 1.0))
-            
-            # Generate detailed reasoning
-            if combined_score > 0.2:
-                sentiment_label = "positive"
-                market_impact = "Bullish sentiment detected - potential upward price pressure"
-            elif combined_score < -0.2:
-                sentiment_label = "negative"
-                market_impact = "Bearish sentiment detected - potential downward price pressure"
-            else:
-                sentiment_label = "neutral"
-                market_impact = "Neutral sentiment - minimal immediate market impact expected"
-            
-            reasoning = f"Analyzed {len(posts)} posts from {len(set(post.get('username', 'unknown') for post in posts))} accounts. "
-            reasoning += f"Overall sentiment: {sentiment_label} (score: {combined_score:.3f}). "
-            reasoning += f"Trump posts: {len(trump_posts)}, Musk posts: {len(musk_posts)}. "
-            reasoning += market_impact
-            
-            return {
-                'sentiment_score': combined_score,
-                'confidence': confidence,
-                'reasoning': reasoning,
-                'data_quality': 'good' if len(posts) >= 5 else 'limited',
-                'account_count': len(set(post.get('username', 'unknown') for post in posts)),
-                'post_details': post_details,
-                'trump_posts': trump_posts,
-                'musk_posts': musk_posts,
-                'market_impact': market_impact
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in sentiment analysis: {e}")
-            return {
-                'sentiment_score': 0.0,
-                'confidence': 0.0,
-                'reasoning': f"Error in sentiment analysis: {str(e)}",
-                'data_quality': 'error',
-                'account_count': 0,
-                'post_details': [],
-                'trump_posts': [],
-                'musk_posts': []
-            }
     
 
 # ── HELPER FUNCTIONS ────────────────────────────────────────────────────────
@@ -3454,9 +3044,6 @@ def display_past_results():
     for i, result in enumerate(reversed(past_results)):  # Show newest first
         result_index = len(past_results) - i
         
-        # Create a unique key for each expander
-        expander_key = f"result_{result['timestamp']}_{i}"
-        
         # Color-code the summary based on performance
         if result['total_return_pct'] > 0:
             performance_color = "🟢"
@@ -3500,8 +3087,8 @@ def display_past_results():
                     trades_per_day = result['total_trades'] / max(1, result['period_days'])
                     st.write(f"• **Trading Frequency:** {trades_per_day:.2f} trades/day")
                 else:
-                    st.write(f"• **Avg Profit/Trade:** N/A")
-                    st.write(f"• **Trading Frequency:** No trades")
+                    st.write("• **Avg Profit/Trade:** N/A")
+                    st.write("• **Trading Frequency:** No trades")
                 
                 if result.get('max_drawdown', 0) != 0:
                     st.write(f"• **Max Drawdown:** {result['max_drawdown']:.2f}%")
@@ -3560,13 +3147,30 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
     else:  # aggressive
         config = TradingConfig.get_aggressive_config(initial_capital)
     
-    # Override with custom settings if provided
-    config.position_size_pct = custom_position_size
-    config.min_confidence = custom_confidence
-    config.signal_threshold = custom_signal_threshold
+    # Override with custom settings if provided.
+    # The None guards make this honour its own comment. Previously the three
+    # assignments were unconditional, so any programmatic caller that passed
+    # None (an ablation runner, a headless script) silently set
+    # signal_threshold to None and every decision then raised
+    # "'>=' not supported between instances of 'int' and 'NoneType'".
+    # In the UI this was harmless because the slider defaults mirror the
+    # presets exactly, but it made the function unusable from anywhere else,
+    # and it would have masked any future drift between sliders and presets.
+    if custom_position_size is not None:
+        config.position_size_pct = custom_position_size
+    if custom_confidence is not None:
+        config.min_confidence = custom_confidence
+    if custom_signal_threshold is not None:
+        config.signal_threshold = custom_signal_threshold
     config.enable_deep_learning = enable_deep_learning
     config.enable_vector_db = enable_vector_db
     config.show_reasoning = show_reasoning
+
+    # Decision cadence is a DURATION, not a bar count. The preset's `6` means
+    # "every 6 hours", which is only true on hourly bars: on daily bars it meant
+    # every 6 days, so a 30-day backtest made two decisions and one round trip.
+    # Convert once, here, so the whole run shares one resolved value.
+    config.simulation_step = decision_step_bars(interval)
     
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -3577,8 +3181,33 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
         progress_bar.progress(10)
         
         df = fetch_binance_ta(symbol_input, interval, start_date, end_date)
-        st.success(f"✅ Fetched {len(df)} data points")
-        
+
+        # PHASE 2: data provenance is surfaced, never assumed.
+        data_source = df.attrs.get('data_source', 'unknown')
+        if data_source == 'binance_live':
+            st.success(f"✅ Fetched {len(df)} data points from Binance (live market data)")
+        else:
+            st.error(
+                f"⚠️ **{len(df)} data points are SYNTHETIC, not real market data.** "
+                "Any result below is a code test only and must NOT be reported as a finding."
+            )
+
+        # The first INDICATOR_WARMUP_BARS rows are consumed by MA20 and friends,
+        # so a run needs strictly more bars than that to have anything to trade.
+        # Without this check the shortfall surfaced far downstream as a bare
+        # "single positional indexer is out-of-bounds" from df.iloc[start_idx],
+        # which says nothing about the actual problem: the window is too short
+        # for the interval. Fail here instead, while the numbers are still in
+        # hand to explain it.
+        if len(df) <= INDICATOR_WARMUP_BARS:
+            raise InsufficientHistory(
+                f"{len(df)} {interval} bars were returned for "
+                f"{start_date} to {end_date}, but the technical indicators "
+                f"consume the first {INDICATOR_WARMUP_BARS} and at least one "
+                f"bar must remain to trade. Widen the date range, or pick a "
+                f"finer interval so the same range yields more bars."
+            )
+
         # Step 2: Initialize agents
         status_text.text("🤖 Initializing AI agents...")
         progress_bar.progress(20)
@@ -3591,7 +3220,6 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
         # Optional agents
         dl_agent = None
         vector_agent = None
-        sentiment_agent = None
         
         if config.enable_deep_learning and ML_AVAILABLE:
             dl_agent = DeepLearningAgent(config)
@@ -3601,9 +3229,152 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
             vector_agent = VectorDBAgent(config)
             vector_agent.initialize()
         
-        # Initialize sentiment agent
-        sentiment_agent = SentimentAnalysisAgent(config, start_date, end_date)
-        
+        # PHASE 3: exogenous positioning agent. All alignment happens once here
+        # against the price index, so the per-bar lookup in the loop below is a
+        # dictionary hit and cannot accidentally re-derive features from data
+        # the bar should not see.
+        # The z-score baseline is interval-dependent: 168 bars is a week of 1h
+        # bars but 168 days of 1d bars, which no realistic cache can warm up.
+        # Resolved once here so the auto-fetch range, the agent and the run
+        # metadata all quote the same number.
+        pos_zscore_window = positioning_zscore_window(interval)
+
+        positioning_agent = None
+        if USE_POSITIONING_SIGNAL and POSITIONING_AVAILABLE:
+            # Download whatever the chosen date range needs and the cache does
+            # not have. First run over a new window pays for it once; every
+            # later run over the same window is a pure cache hit.
+            if POSITIONING_AUTO_FETCH:
+                try:
+                    # Fetch the z-score warm-up window too, or the first
+                    # POSITIONING_ZSCORE_WINDOW bars of the backtest silently
+                    # run with no positioning signal. Same helper the agent
+                    # uses, so the two ranges cannot drift apart.
+                    pos_start = warmup_start_date(df.index, pos_zscore_window)
+                    pos_end = df.index.max().date()
+                    pending = missing_days(symbol_input, pos_start, pos_end)
+                    if pending:
+                        fetch_bar = st.progress(0)
+                        fetch_text = st.empty()
+                        fetch_text.text(
+                            f"📥 Downloading {len(pending)} day(s) of positioning "
+                            f"data (free, no API key)..."
+                        )
+
+                        def _report(done, total, day):
+                            fetch_bar.progress(min(1.0, done / max(total, 1)))
+                            fetch_text.text(
+                                f"📥 Positioning data {done}/{total} ({day})"
+                            )
+
+                        fetch_summary = ensure_cached(
+                            symbol_input, pos_start, pos_end, progress=_report,
+                        )
+                        fetch_bar.empty()
+                        fetch_text.empty()
+                        logger.info(
+                            f"Positioning auto-fetch: {json.dumps(fetch_summary, default=str)}"
+                        )
+                        if fetch_summary.get("failed"):
+                            st.warning(
+                                f"⚠️ {len(fetch_summary['failed'])} positioning day(s) "
+                                f"could not be downloaded; the signal will run on "
+                                f"the days that succeeded."
+                            )
+                except Exception as e:
+                    # A data-download problem must not take down the backtest.
+                    logger.warning(f"Positioning auto-fetch failed: {e}")
+                    st.warning(f"⚠️ Positioning auto-fetch failed: {e}")
+
+            positioning_agent = PositioningSignalAgent(
+                symbol=symbol_input,
+                bar_index=df.index,
+                enabled=True,
+                lag_bars=POSITIONING_LAG_BARS,
+                max_points=POSITIONING_MAX_POINTS,
+                zscore_window=pos_zscore_window,
+            )
+            if positioning_agent.available:
+                st.success(f"✅ Positioning signal: {positioning_agent.status}")
+            else:
+                # Loud, not silent. A run with a dead exogenous channel is a
+                # different experiment from one with a live channel, and the
+                # difference must be visible in the UI, not just the log.
+                st.warning(
+                    f"⚠️ Positioning signal enabled but unusable: "
+                    f"{positioning_agent.status}"
+                )
+        elif USE_POSITIONING_SIGNAL and not POSITIONING_AVAILABLE:
+            st.warning("⚠️ USE_POSITIONING_SIGNAL is on but the signals module "
+                       "failed to import; running without it.")
+
+        # PHASE 3: exogenous text sentiment. Documents are fetched, scored and
+        # aligned once here rather than per bar, because scoring is the
+        # expensive step and a 24h trailing window would otherwise re-score the
+        # same documents once for every bar that window covers.
+        text_agent = None
+        if USE_TEXT_SENTIMENT and TEXT_SENTIMENT_AVAILABLE:
+            if TEXT_SENTIMENT_AUTO_FETCH:
+                try:
+                    txt_start = text_warmup_start_date(
+                        df.index, TEXT_SENTIMENT_ZSCORE_WINDOW,
+                        TEXT_SENTIMENT_WINDOW_HOURS)
+                    txt_end = df.index.max().date()
+                    pending = text_missing_days(
+                        txt_start, txt_end, queries=TEXT_SENTIMENT_QUERIES)
+                    if pending:
+                        txt_bar = st.progress(0)
+                        txt_text = st.empty()
+                        txt_text.text(
+                            f"📥 Downloading {len(pending)} day(s) of text sentiment "
+                            f"documents (free, no API key)..."
+                        )
+
+                        def _txt_report(done, total, label):
+                            txt_bar.progress(min(1.0, done / max(total, 1)))
+                            txt_text.text(f"📥 Text sentiment {done}/{total} ({label})")
+
+                        txt_summary = ensure_text_cached(
+                            txt_start, txt_end, queries=TEXT_SENTIMENT_QUERIES,
+                            progress=_txt_report,
+                        )
+                        txt_bar.empty()
+                        txt_text.empty()
+                        logger.info(
+                            f"Text sentiment auto-fetch: "
+                            f"{json.dumps(txt_summary, default=str)}"
+                        )
+                        if txt_summary.get("failed"):
+                            st.warning(
+                                f"⚠️ {len(txt_summary['failed'])} text sentiment "
+                                f"request(s) failed; the signal will run on what "
+                                f"succeeded."
+                            )
+                except Exception as e:
+                    logger.warning(f"Text sentiment auto-fetch failed: {e}")
+                    st.warning(f"⚠️ Text sentiment auto-fetch failed: {e}")
+
+            with st.spinner("🧠 Scoring text sentiment corpus..."):
+                text_agent = TextSentimentAgent(
+                    bar_index=df.index,
+                    queries=TEXT_SENTIMENT_QUERIES,
+                    enabled=True,
+                    scorer_name=TEXT_SENTIMENT_SCORER,
+                    lag_bars=TEXT_SENTIMENT_LAG_BARS,
+                    window_hours=TEXT_SENTIMENT_WINDOW_HOURS,
+                    zscore_window=TEXT_SENTIMENT_ZSCORE_WINDOW,
+                    max_points=TEXT_SENTIMENT_MAX_POINTS,
+                    min_documents=TEXT_SENTIMENT_MIN_DOCS,
+                )
+            if text_agent.available:
+                st.success(f"✅ Text sentiment: {text_agent.status}")
+            else:
+                st.warning(f"⚠️ Text sentiment enabled but unusable: "
+                           f"{text_agent.status}")
+        elif USE_TEXT_SENTIMENT and not TEXT_SENTIMENT_AVAILABLE:
+            st.warning("⚠️ USE_TEXT_SENTIMENT is on but the text sentiment module "
+                       "failed to import; running without it.")
+
         st.success("✅ All agents initialized")
         
         # Step 3: Run simulation
@@ -3624,12 +3395,31 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
         daily_values = []
         
         # Skip initial rows for technical indicators to stabilize
-        start_idx = 20
+        start_idx = INDICATOR_WARMUP_BARS
         simulation_points = list(range(start_idx, len(df), config.simulation_step))
-        
+
+        # A run's headline numbers rest on the number of DECISIONS, not the
+        # number of bars or days. A 30-day daily window looks substantial and
+        # yields eleven decisions; at the old six-day cadence it yielded two,
+        # and "50% win rate" then meant one winning trade out of two. Say so
+        # here rather than letting the executive summary imply more than the
+        # sample can support.
+        st.info(
+            f"🧮 {len(df)} bars · {INDICATOR_WARMUP_BARS} consumed by indicator "
+            f"warmup · deciding every {config.simulation_step} bar(s) "
+            f"(~{DECISION_CADENCE_HOURS:g}h) → **{len(simulation_points)} decision "
+            f"points**."
+        )
+        if len(simulation_points) < 30:
+            st.warning(
+                f"⚠️ Only {len(simulation_points)} decision points. Win rate, "
+                f"average trade and 'beat the market' are dominated by noise at "
+                f"this sample size and should not be read as evidence. Widen the "
+                f"date range, or use a finer interval, before drawing conclusions."
+            )
+
         # Track sentiment for the entire period
-        sentiment_scores = []
-        
+
         for i, current_idx in enumerate(simulation_points):
             try:
                 current_data = df.iloc[current_idx]
@@ -3651,22 +3441,16 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
                 last_decision = decisions_log[-1] if decisions_log else None
                 risk_assessment = risk_agent.assess_risk(timestamp, portfolio=portfolio, last_decision=last_decision)
                 
-                # Step 3d: Sentiment Analysis
-                sentiment_result = {"sentiment_score": 0.0, "confidence": 0.0, "reasoning": "Sentiment analysis not available"}
-                try:
-                    # Get posts around this timestamp
-                    posts = []
-                    for account in sentiment_agent.target_accounts.keys():
-                        account_posts = sentiment_agent._generate_simulated_posts(account, 3, timestamp)
-                        posts.extend(account_posts)
-                    
-                    if posts:
-                        sentiment_result = sentiment_agent.analyze_sentiment(posts)
-                        sentiment_scores.append(sentiment_result['sentiment_score'])
-                except Exception as e:
-                    logger.warning(f"Sentiment analysis failed: {e}")
-                    sentiment_scores.append(0.0)
-                
+                # Step 3d: Exogenous futures positioning (point-in-time)
+                positioning_reading = None
+                if positioning_agent is not None:
+                    positioning_reading = positioning_agent.reading_for(timestamp)
+
+                # Step 3e: Exogenous text sentiment (point-in-time)
+                text_reading = None
+                if text_agent is not None:
+                    text_reading = text_agent.reading_for(timestamp)
+
                 # Step 3e: Deep Learning Prediction
                 dl_prediction = None
                 if dl_agent and dl_agent.is_trained:
@@ -3684,16 +3468,43 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
                     vector_insights = vector_agent.get_performance_insights(current_conditions)
                 
                 # Step 3g: Final Decision
+                # PHASE 1: every agent's output is now passed to the decision
+                # maker. Sentiment, deep learning and retrieval used to be
+                # computed here and then dropped into the log without ever
+                # reaching make_decision.
                 decision = decision_agent.make_decision(
-                    timestamp, market_analysis, pattern_analysis, 
-                    risk_assessment, portfolio, last_decision
+                    timestamp, market_analysis, pattern_analysis,
+                    risk_assessment, portfolio, last_decision,
+                    dl_prediction=dl_prediction,
+                    vector_insights=vector_insights,
+                    positioning=positioning_reading,
+                    text_sentiment=text_reading,
                 )
-                
+
                 # Step 3h: Execute Trade
-                trade_result = execute_trade(decision, portfolio, current_price, config, timestamp)
+                # PHASE 2: fill at the NEXT bar's open, since the decision was
+                # made from this bar's close. The final bar has no successor, so
+                # no order placed on it can be filled.
+                fill_price, fill_timestamp = None, None
+                if EXECUTION_MODE == "next_open" and current_idx + 1 < len(df):
+                    next_bar = df.iloc[current_idx + 1]
+                    fill_price = next_bar['open']
+                    fill_timestamp = df.index[current_idx + 1]
+                elif EXECUTION_MODE == "next_open":
+                    fill_price = None  # no next bar: order cannot be filled
+                    trade_result = None
+
+                if EXECUTION_MODE != "next_open" or current_idx + 1 < len(df):
+                    trade_result = execute_trade(
+                        decision, portfolio, current_price, config, timestamp,
+                        fill_price=fill_price, fill_timestamp=fill_timestamp,
+                    )
+                else:
+                    trade_result = None
+
                 if trade_result:
                     trades.append(trade_result)
-                
+
                 # Log decision
                 decisions_log.append({
                     'timestamp': timestamp,
@@ -3701,9 +3512,15 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
                     'market_analysis': market_analysis[:200] + "..." if len(market_analysis) > 200 else market_analysis,
                     'pattern_analysis': pattern_analysis[:200] + "..." if len(pattern_analysis) > 200 else pattern_analysis,
                     'risk_assessment': risk_assessment,
-                    'sentiment': sentiment_result,
+                    'positioning': (positioning_reading.to_dict()
+                                    if positioning_reading is not None else None),
+                    'text_sentiment': (text_reading.to_dict()
+                                       if text_reading is not None else None),
                     'dl_prediction': dl_prediction,
-                    'vector_insights': vector_insights
+                    'vector_insights': vector_insights,
+                    # Phase 1 telemetry: what the LLM changed on this decision
+                    'llm_contribution': decision.llm,
+                    'rule_action': decision.rule_action,
                 })
                 
                 # Calculate portfolio value
@@ -3755,6 +3572,144 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
         profitable_trades = sum(1 for trade in trades if trade.get('profit', 0) > 0)
         win_rate = (profitable_trades / len(trades) * 100) if trades else 0
         
+        # PHASE 1 MEASUREMENT: how much did the LLM actually contribute?
+        # This is the number that answers the reviewer's central question, so it
+        # travels with the result rather than being recomputed by hand.
+        agent_stats = decision_agent.stats
+        llm_calls = agent_stats["llm_calls"]
+        llm_report = {
+            'llm_enabled': decision_agent.use_llm,
+            'decisions': agent_stats["decisions"],
+            'llm_calls': llm_calls,
+            'llm_failures': agent_stats["llm_failures"],
+            'llm_success_rate_pct': ((llm_calls - agent_stats["llm_failures"]) / llm_calls * 100) if llm_calls else 0.0,
+            'decisions_changed_by_llm': agent_stats["changed"],
+            'change_rate_pct': (agent_stats["changed"] / agent_stats["decisions"] * 100) if agent_stats["decisions"] else 0.0,
+            'risk_vetoes': agent_stats["vetoes"],
+            'avg_llm_latency_s': (agent_stats["total_latency_s"] / llm_calls) if llm_calls else 0.0,
+            'total_llm_latency_s': agent_stats["total_latency_s"],
+        }
+
+        # PHASE 3 MEASUREMENT: what did the exogenous positioning channel do?
+        # Reported per run for the same reason as llm_report: the ablation table
+        # in the paper needs the marginal contribution of each channel, and a
+        # channel that fired on zero bars must be visibly distinguishable from
+        # one that fired and simply did not help.
+        pos_readings = [d.get('positioning') for d in decisions_log
+                        if d.get('positioning')]
+        pos_usable = [p for p in pos_readings if p.get('available')]
+        pos_acted = [p for p in pos_usable
+                     if p.get('bullish_points') or p.get('bearish_points')]
+        positioning_report = {
+            'enabled': USE_POSITIONING_SIGNAL,
+            'module_available': POSITIONING_AVAILABLE,
+            'agent': positioning_agent.summary() if positioning_agent else None,
+            'decisions_with_reading': len(pos_usable),
+            'decisions_total': len(decisions_log),
+            'decisions_where_points_added': len(pos_acted),
+            'pct_decisions_moved': (
+                round(100.0 * len(pos_acted) / len(decisions_log), 2)
+                if decisions_log else 0.0
+            ),
+            'mean_score': (
+                round(float(np.mean([p['score'] for p in pos_usable])), 4)
+                if pos_usable else None
+            ),
+            'max_points': POSITIONING_MAX_POINTS,
+            'lag_bars': POSITIONING_LAG_BARS,
+            # The RESOLVED window, not the raw config value: on a daily run
+            # these differ, and the number that describes the run is this one.
+            'zscore_window_bars': pos_zscore_window,
+        }
+
+        # PHASE 3 MEASUREMENT: what did the text sentiment channel do? Same
+        # rationale as positioning_report -- a channel that fired on zero bars
+        # must stay visibly distinct from one that fired and did not help.
+        txt_readings = [d.get('text_sentiment') for d in decisions_log
+                        if d.get('text_sentiment')]
+        txt_usable = [t for t in txt_readings if t.get('available')]
+        txt_acted = [t for t in txt_usable
+                     if t.get('bullish_points') or t.get('bearish_points')]
+        text_sentiment_report = {
+            'enabled': USE_TEXT_SENTIMENT,
+            'module_available': TEXT_SENTIMENT_AVAILABLE,
+            'agent': text_agent.summary() if text_agent else None,
+            'decisions_with_reading': len(txt_usable),
+            'decisions_total': len(decisions_log),
+            'decisions_where_points_added': len(txt_acted),
+            'pct_decisions_moved': (
+                round(100.0 * len(txt_acted) / len(decisions_log), 2)
+                if decisions_log else 0.0
+            ),
+            'mean_score': (
+                round(float(np.mean([t['score'] for t in txt_usable])), 4)
+                if txt_usable else None
+            ),
+            'mean_docs_per_reading': (
+                round(float(np.mean([t.get('doc_count', 0) for t in txt_usable])), 1)
+                if txt_usable else None
+            ),
+            'scorer': TEXT_SENTIMENT_SCORER,
+            'queries': list(TEXT_SENTIMENT_QUERIES),
+            'max_points': TEXT_SENTIMENT_MAX_POINTS,
+            'lag_bars': TEXT_SENTIMENT_LAG_BARS,
+            'window_hours': TEXT_SENTIMENT_WINDOW_HOURS,
+        }
+
+        # PHASE 2: every run carries its own provenance so a reported number can
+        # always be traced back to its data source, model and execution rules.
+        run_metadata = {
+            'run_at': datetime.now().isoformat(),
+            'symbol': symbol_input,
+            'interval': interval,
+            'start_date': str(start_date),
+            'end_date': str(end_date),
+            'data_source': df.attrs.get('data_source', 'unknown'),
+            'data_source_label': df.attrs.get('data_source_label', 'unknown'),
+            'bars': len(df),
+            # How often the system stopped to decide, and how many of the bars
+            # it could actually act on. A run's headline numbers rest on the
+            # DECISION count, not the bar count, so both belong in the record.
+            'decision_cadence_hours': DECISION_CADENCE_HOURS,
+            'decision_step_bars': config.simulation_step,
+            'warmup_bars': INDICATOR_WARMUP_BARS,
+            'decision_points': len(simulation_points),
+            # Naming a deployment that made zero calls would misdescribe the
+            # run, and probing it costs a network round trip the rules-only arm
+            # should not need.
+            'model': (describe_active_model() if USE_LLM_DECISIONS else {
+                "provider": "none",
+                "note": "rules-only arm (USE_LLM_DECISIONS=false): no model "
+                        "was called by any agent",
+            }),
+            'execution_mode': EXECUTION_MODE,
+            'slippage_pct': SLIPPAGE_PCT,
+            'buy_fee_pct': config.buy_fee_pct,
+            'sell_fee_pct': config.sell_fee_pct,
+            'strategy_mode': strategy_mode,
+            'signal_threshold': config.signal_threshold,
+            'min_confidence': config.min_confidence,
+            'llm_max_adjustment': LLM_MAX_ADJUSTMENT,
+            'positioning_enabled': USE_POSITIONING_SIGNAL,
+            'positioning_source': (
+                positioning_agent.summary().get('source')
+                if positioning_agent and positioning_agent.available else None
+            ),
+            'text_sentiment_enabled': USE_TEXT_SENTIMENT,
+            'text_sentiment_scorer': (
+                TEXT_SENTIMENT_SCORER if text_agent and text_agent.available else None
+            ),
+            'text_sentiment_source': (
+                text_agent.summary().get('source')
+                if text_agent and text_agent.available else None
+            ),
+            'synthetic_data_allowed': ALLOW_SYNTHETIC_DATA,
+            # Every text channel in the system now reads from a cached, hashed
+            # real corpus (see the manifests under data/exogenous/), so the only
+            # remaining publication risk is the price series itself.
+            'publication_safe': df.attrs.get('data_source') == 'binance_live',
+        }
+
         # Prepare summary
         summary = {
             'initial_capital': config.initial_capital,
@@ -3766,11 +3721,24 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
             'winning_trades': profitable_trades,
             'win_rate_pct': win_rate,
             'daily_values': daily_values,
+            # PHASE 3: risk-adjusted metrics. These keys were READ by the past-
+            # results panel and never WRITTEN, so Sharpe and max drawdown always
+            # displayed as 0 and the panel guarding on `!= 0` never rendered.
+            # Return alone cannot separate a good strategy from a leveraged one.
+            **describe_run(daily_values, total_return_pct=total_return),
             'outperformed_market': total_return > buy_hold_return,
-            'avg_sentiment': np.mean(sentiment_scores) if sentiment_scores else 0.0,
-            'decisions': len(decisions_log)
+            'decisions': len(decisions_log),
+            'llm_report': llm_report,
+            'positioning_report': positioning_report,
+            'text_sentiment_report': text_sentiment_report,
+            'run_metadata': run_metadata,
         }
-        
+
+        logger.info(f"Run metadata: {json.dumps(run_metadata, default=str)}")
+        logger.info(f"LLM contribution: {json.dumps(llm_report, default=str)}")
+        logger.info(f"Positioning contribution: {json.dumps(positioning_report, default=str)}")
+        logger.info(f"Text sentiment contribution: {json.dumps(text_sentiment_report, default=str)}")
+
         progress_bar.progress(100)
         status_text.text("✅ Simulation complete!")
         
@@ -3783,13 +3751,35 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
         # Step 5a: Save simulation result to session state for past results
         save_simulation_result(summary, symbol_input, strategy_mode, start_date, end_date)
         
-        # Step 6: Save results
-        if database_available:
+        # Step 6: Save results (skipped unless database persistence is enabled)
+        if get_database_available():
             save_results_to_db(summary, df, symbol_input, start_date, end_date, interval)
         
         # Reset simulation state
         st.session_state.simulation_running = False
         
+    except InsufficientHistory as e:
+        # Expected, correctable stop: the requested window is too short for the
+        # chosen interval. Not a bug, and not worth a traceback.
+        st.session_state.simulation_running = False
+        st.error(f"📏 Not enough history: {e}")
+        st.info(
+            f"The first {INDICATOR_WARMUP_BARS} bars are spent warming up the "
+            "moving averages, so they can never be traded. A daily interval "
+            f"needs more than {INDICATOR_WARMUP_BARS} calendar days; an hourly "
+            f"interval needs more than {INDICATOR_WARMUP_BARS} hours."
+        )
+
+    except SyntheticDataBlocked as e:
+        # Expected, deliberate stop: live data was unavailable and we refuse to
+        # silently substitute fabricated prices.
+        st.session_state.simulation_running = False
+        st.error(f"🛑 Simulation stopped: {e}")
+        st.info(
+            "This guard exists so a synthetic run can never be mistaken for a real result. "
+            "Check your network or Binance availability and retry."
+        )
+
     except Exception as e:
         # Reset simulation state on error
         st.session_state.simulation_running = False
@@ -3799,13 +3789,9 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
 # ── STREAMLIT UI ───────────────────────────────────────────────────────────
 def main():
     """Main Streamlit application"""
-    st.set_page_config(
-        page_title="AMAAI Multi-Agent Trading System",
-        page_icon="🤖",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
+    # NOTE: st.set_page_config() is called once at module scope (top of file),
+    # because Streamlit requires it to be the very first st.* command.
+
     # Initialize session state for past results
     initialize_session_state()
     
@@ -3953,24 +3939,27 @@ def main():
     
     # System Status (collapsible)
     with st.sidebar.expander("ℹ️ System Status", expanded=False):
-        # API Key status
-        if os.getenv("OPENAI_API_KEY"):
-            st.success("✅ OpenAI API Key configured")
+        # LLM provider status
+        llm_ok, llm_detail = get_llm_provider_status()
+        if llm_ok:
+            st.success(f"✅ LLM configured - {llm_detail}")
         else:
-            st.error("❌ OpenAI API Key missing")
-            st.info("Add OPENAI_API_KEY to your .env file")
+            st.error(f"❌ LLM not configured - {llm_detail}")
+            st.info("Set AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY (Foundry) or OPENAI_API_KEY in your .env file")
         
-        # Database status
-        if database_available:
-            st.success("✅ Database connected")
+        # Result persistence status
+        if get_database_available():
+            st.success("✅ Database connected - results are saved")
+        elif ENABLE_DATABASE:
+            st.warning("⚠️ Database enabled but unreachable - results kept in-session only")
         else:
-            st.warning("⚠️ Database not available")
+            st.info("💾 Result saving disabled - past runs are kept for this session only")
         
         # Feature availability
         st.markdown("**Available Features:**")
         st.markdown(f"🧠 Deep Learning: {'✅' if ML_AVAILABLE else '❌'}")
         st.markdown(f"🗄️ Vector DB: {'✅' if VECTOR_DB_AVAILABLE else '❌'}")
-        st.markdown(f"📊 Sentiment Analysis: {'✅' if SENTIMENT_AVAILABLE else '❌'}")
+        st.markdown(f"📊 Text Sentiment: {'✅' if TEXT_SENTIMENT_AVAILABLE else '❌'}")
     
     # Main content area
     if start_date >= end_date:
@@ -4026,25 +4015,31 @@ def main():
             """)
         
         with strategy_info_col2:
-            # Calculate strategy characteristics
+            # Calculate strategy characteristics. The trade ceiling is set by
+            # the DECISION CADENCE and the interval, not by the mode: all three
+            # presets decide equally often and differ only in how readily a
+            # decision becomes a trade (signal_threshold, min_confidence).
+            # These numbers used to be hardcoded fictions -- "10+ per week" for
+            # aggressive, while a daily run could not exceed one decision every
+            # six days -- so they are computed from the real cadence now.
             if strategy_mode == "conservative":
-                risk_level = "Low"
-                trading_freq = "Low"
-                expected_trades = "3-5 per week"
+                risk_level, selectivity = "Low", "Very selective (3 signals, 80% confidence)"
             elif strategy_mode == "moderate":
-                risk_level = "Medium"
-                trading_freq = "Medium"
-                expected_trades = "5-10 per week"
+                risk_level, selectivity = "Medium", "Selective (2 signals, 65% confidence)"
             else:  # aggressive
-                risk_level = "High"
-                trading_freq = "High"
-                expected_trades = "10+ per week"
-            
+                risk_level, selectivity = "High", "Permissive (1 signal, 55% confidence)"
+
+            step_bars = decision_step_bars(interval)
+            bar_hours = interval_hours(interval) or 1.0
+            hours_between = step_bars * bar_hours
+            per_week = 168.0 / hours_between if hours_between else 0.0
+
             st.markdown(f"""
             **Trading Characteristics:**
             - Risk Level: **{risk_level}**
-            - Trading Frequency: **{trading_freq}**
-            - Expected Trades: **{expected_trades}**
+            - Decides: **every {hours_between:g}h** ({step_bars} × {interval} bar)
+            - Max decisions: **{per_week:.0f} per week** (trades ≤ this)
+            - Signal filter: **{selectivity}**
             """)
         
         with strategy_info_col3:

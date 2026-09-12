@@ -1,0 +1,58 @@
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ── Virtual environments ───────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Secrets ────────────────────────────────────────────────────────────────
+# `.env` holds a live Azure key and is NOT tracked (untracked 2026-09-13 with
+# `git rm --cached .env`; the file itself stays on disk). Every value it needs
+# is listed in `.env.example`, which carries the research parameters but blank
+# credentials -- copy it to `.env` and fill in your own keys.
+#
+# If you ever need to re-add a tracked .env: don't. Add the variable to
+# `.env.example` instead. A key committed once lives in the history forever,
+# and rotating it is the only real fix.
+.env
+.env.local
+*.pem
+!signals/*.pem
+
+# ── Exogenous data cache (Phase 3) ─────────────────────────────────────────
+# Raw payloads are reconstructible with the fetchers:
+#   python -m signals.binance_positioning fetch --symbol ... --start ... --end ...
+#   python -m signals.text_sentiment      fetch --start ... --end ...
+# so they are not committed (the HN corpus alone is ~20 MB per quarter). The
+# manifests ARE committed: they carry the URL, pull timestamp, document count
+# and sha256 of every payload, which is the provenance record a reviewer needs
+# in order to verify that a re-fetch matches.
+data/exogenous/**/*.zip
+data/exogenous/text_sentiment/**/*.json
+!data/exogenous/**/manifest.jsonl
+
+# ── Experiment output ──────────────────────────────────────────────────────
+# Ablation runs are cheap to regenerate and one JSONL row per arm accumulates
+# fast. Commit a specific results file deliberately when it backs a claim in
+# the paper, rather than letting every exploratory run land in history.
+experiments/results/
+
+# ── Local tooling ──────────────────────────────────────────────────────────
+# Claude Code's permission list. No secrets, but it is per-developer and full
+# of machine-specific absolute temp paths, so it is noise in a shared repo.
+# Delete this line if you want the team to share one permission set.
+.claude/
+
+# ── Models, logs, scratch ──────────────────────────────────────────────────
+*.h5
+*.keras
+*.joblib
+*.pkl
+*.log
+.DS_Store
+Thumbs.db

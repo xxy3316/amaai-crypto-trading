@@ -5,26 +5,36 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![OpenAI](https://img.shields.io/badge/OpenAI-412991?logo=openai&logoColor=white)](https://openai.com/)
 
-An advanced AI-powered trading system that combines **multi-agent coordination**, **sentiment analysis**, and **technical analysis** for sophisticated cryptocurrency trading decisions. Built with LangChain, Streamlit, and integrated with real-time market data.
+An AI trading research system that combines **multi-agent coordination**, **exogenous non-price signals** (text sentiment and futures positioning) and **technical analysis** into auditable cryptocurrency trading decisions. Built with LangChain and Streamlit, on live Binance market data, with point-in-time discipline and a factorial ablation harness.
 
 ![Trading System Demo](https://img.shields.io/badge/Demo-Live-green) 
 
 ## ✨ Key Features
 
 ### 🚀 **Advanced AI Trading**
-- **Multi-Agent Architecture**: Coordinated agents for technical analysis, sentiment analysis, and risk management
-- **Real-Time Sentiment Analysis**: Analyzes social media posts from influential accounts (Elon Musk, Donald Trump, etc.)
+- **Multi-Agent Architecture**: Coordinated agents for technical analysis, text sentiment, futures positioning and risk management
+- **Text Sentiment**: Real Hacker News posts and comments (keyless Algolia API), scored with VADER plus a crypto lexicon, or optionally CryptoBERT
+- **Futures Positioning**: Free Binance USD-M perpetual positioning metrics — crowd long/short faded, top-trader and taker flow followed
 - **Technical Indicators**: RSI, MACD, Bollinger Bands, Moving Averages with professional TradingView-style charts
 - **Smart Decision Making**: LangChain-powered decision engine with reasoning transparency
 
+> **Removed:** an earlier "real-time sentiment analysis of influential accounts
+> (Elon Musk, Donald Trump)" feature. It generated its own posts, attributed
+> them to real named people, and — once synthetic data was switched off —
+> returned a hard `0.0` on every bar while still occupying two large UI panels.
+> It has been deleted outright rather than left switchable. See
+> [Exogenous Signal: Text Sentiment](#-exogenous-signal-text-sentiment-hacker-news)
+> for what replaced it.
+
 ### 📊 **Professional Trading Interface**
 - **Interactive Dashboard**: Streamlit-based web interface with real-time updates
-- **Trade History & P&L**: Comprehensive trade tracking with profit/loss analysis and sentiment correlation
+- **Trade History & P&L**: Comprehensive trade tracking with profit/loss analysis
+- **Per-Channel Attribution**: How many decisions each exogenous channel actually moved, and how many the LLM changed
 - **Performance Metrics**: Win rate, drawdown analysis, portfolio performance vs buy-and-hold
 - **Technical Charts**: Professional candlestick charts with trading signals and indicators
 
 ### 🎯 **Smart Features**
-- **Sentiment-Driven Trading**: Correlates social media sentiment with trading decisions
+- **Point-in-Time Signals**: Every exogenous channel is lagged and z-scored against its own trailing baseline, so no bar can see its own future
 - **Risk Management**: Configurable position sizing and stop-loss mechanisms
 - **Historical Analysis**: Review past simulation results and trading performance
 - **Real-Time Reasoning**: Transparent agent decision-making process
@@ -99,44 +109,366 @@ python test/test_quick_validation.py
 
 # Comprehensive test suite
 python test/test_runner.py
+
+# Exogenous positioning signal (41 offline unit tests)
+python test/test_binance_positioning.py
+
+# Exogenous text sentiment (40 offline unit tests)
+python test/test_text_sentiment.py
+
+# Signal wiring: do the signals actually reach a trade? (27 tests)
+python test/test_positioning_integration.py
 ```
+
+## 📡 Exogenous Signal: Binance Futures Positioning
+
+The social-sentiment channel this project shipped with was **decorative**: the
+backtest loop requested synthetic posts, the Phase 2 integrity guards correctly
+switched synthetic data off, and the sentiment score was therefore a hard `0.0`
+on every bar. A constant cannot change a trade.
+
+Buying an X/Twitter API tier does not fix that, because a backtest needs posts
+at *specific past timestamps* and the affordable tiers only serve a 7-day
+recent-search window. Instead, the channel is replaced with **Binance USD-M
+futures positioning** — free, keyless, and reproducible.
+
+### Why this source
+
+| Property | Detail |
+|---|---|
+| Cost | Free, no account, no API key, no rate limit |
+| Endpoint | `data.binance.vision/data/futures/um/daily/metrics/` |
+| Resolution | 5-minute, so mapping onto 1h bars is downsampling, never interpolation |
+| Reproducibility | **Static files.** A reviewer re-downloading gets identical bytes |
+| Integrity | Binance publishes a `.CHECKSUM` per file; the fetcher verifies it and refuses to cache a mismatch |
+| Construct | *Revealed* preference (what traders did with money) rather than *stated* preference (what they posted) |
+
+Features used, with a fixed and deliberately un-tuned sign convention:
+
+| Column | Reading | Direction |
+|---|---|---|
+| `count_long_short_ratio` | crowd account skew | **contrarian** (faded) |
+| `sum_toptrader_long_short_ratio` | top-trader position skew | **momentum** (followed) |
+| `sum_taker_long_short_vol_ratio` | aggressive taker flow | **momentum** (followed) |
+| `sum_open_interest` | crowding intensity | non-directional, diagnostic only |
+
+### Point-in-time discipline
+
+The bar whose **open** time is `t` sees only rows with
+`create_time <= t - POSITIONING_LAG_BARS * bar_duration`. With the default lag
+of 1 bar, positioning is lagged strictly more than price (the price path already
+uses that bar's *close*), so the signal cannot manufacture a look-ahead
+advantage. Rolling z-scores use right-aligned `pandas.rolling`, which is causal.
+Both properties are asserted in `test/test_binance_positioning.py`, including a
+truncation test that fails if any future observation leaks into an earlier
+window.
+
+### Running it — nothing extra to do
+
+```bash
+streamlit run auto-trade.py
+```
+
+That is the whole workflow. On the first run over a new date range the app
+downloads the positioning days it needs (showing a progress bar), caches them,
+and every later run over that range is a pure cache hit. It also fetches the
+z-score warm-up window, so the requested period is usable from its **first**
+bar rather than losing its first `POSITIONING_ZSCORE_WINDOW` bars to warm-up.
+
+Behind a TLS-inspecting corporate proxy, the fetcher detects the `SSLError`,
+builds a merged certifi + Windows-trust-store CA bundle once, and retries. This
+is applied per-request rather than by setting `REQUESTS_CA_BUNDLE` globally, so
+components that already work — ccxt price downloads, the Azure OpenAI client —
+are untouched. `verify=False` is never used: it would make the data-provenance
+claim unverifiable.
+
+### Optional CLI (for inspection and frozen runs)
+
+```bash
+# Confirm reachability and that the upstream schema still matches
+python -m signals.binance_positioning probe --symbol BTCUSDT --date 2024-01-02
+
+# Pre-populate the cache (idempotent; re-run to fill gaps)
+python -m signals.binance_positioning fetch --symbol BTCUSDT \
+    --start 2024-01-01 --end 2024-03-31
+
+# Coverage, feature distributions and how often the signal would fire
+python -m signals.binance_positioning report --symbol BTCUSDT
+
+# Rebuild the corporate CA bundle by hand, if the auto-heal ever fails
+python -m signals.corporate_ca
+```
+
+Raw zips are gitignored because `fetch` reconstructs them byte-for-byte;
+`manifest.jsonl` is committed and carries the URL, pull timestamp and SHA-256
+of every file.
+
+### Configuration
+
+```bash
+USE_POSITIONING_SIGNAL=true      # false = exogenous-signal-off ablation arm
+POSITIONING_AUTO_FETCH=true      # false = frozen offline run (use for the paper)
+POSITIONING_MAX_POINTS=2         # cap; 2 matches the weight of the RSI rule
+POSITIONING_LAG_BARS=1           # extra lag beyond the point-in-time cutoff
+POSITIONING_ZSCORE_WINDOW=168    # causal z-score window in bars (1 week of 1h)
+```
+
+Set `USE_POSITIONING_SIGNAL=false` to get the exogenous-signal-off arm, which
+reproduces the pre-Phase-3 behaviour exactly — that is what keeps the ablation
+arms comparable. For the final numbers in a write-up, pre-populate the cache
+with `fetch` and set `POSITIONING_AUTO_FETCH=false`, so the run touches the
+network zero times and is replayable offline.
+
+Positioning enters the **rule engine**, not only the LLM prompt. That
+distinction is what makes the ablation identifiable: a signal that reached the
+decision solely through the prompt would contribute nothing in the
+`USE_LLM_DECISIONS=false` arm, and "positioning adds information" could not be
+separated from "the LLM adds information". Every run reports
+`positioning_report`, including the share of decisions the channel actually
+moved, so a channel that fired on zero bars is visibly distinguishable from one
+that fired and simply did not help.
+
+### Two caveats that belong in any write-up
+
+1. **Cross-market.** These metrics describe the USD-M *perpetual futures*
+   market while the backtest trades *spot*. Using futures positioning as a
+   signal for spot is standard practice, but it is a modelling choice and
+   should be disclosed.
+2. **Coverage.** History depends on when Binance began publishing per symbol
+   (roughly 2020 for BTCUSDT) and the newest day arrives with a lag. Trust the
+   `report` output over any assumed range: on Q1 2024 BTCUSDT it yields 26,083
+   raw 5-minute rows, 96–98% usable hourly bars after the z-score warm-up, and
+   points added on roughly 15% of bars.
+
+## 💬 Exogenous Signal: Text Sentiment (Hacker News)
+
+The second exogenous channel, and the one that finally makes "sentiment" mean
+something here: **real public posts, with real timestamps, scored by a real
+model**. It replaces the synthetic-tweet path entirely.
+
+### Why Hacker News
+
+Every obvious source was measured from this project's network on 2026-09-09:
+
+| Source | Result |
+|---|---|
+| Reddit (`.json`, search) | **HTTP 403** — blocked by the corporate proxy |
+| StockTwits | **HTTP 403** — blocked by the corporate proxy |
+| CryptoPanic | **HTTP 403** — blocked by the corporate proxy |
+| GDELT | **HTTP 429** — rate-limits the proxy's shared egress IP, even after 20s idle |
+| CryptoCompare news | **HTTP 401** — now requires an API key |
+| X / Twitter | Paid tiers cannot serve historical posts for a backtest anyway |
+| **Hacker News (Algolia)** | **HTTP 200** — free, keyless, complete archive back to 2007 |
+
+Hacker News is a smaller and more technical crowd than Reddit. That is a real
+limitation and belongs in any write-up — but it is genuine, timestamped, public
+text that a reviewer can re-fetch, which none of the blocked options are.
+
+**Measured on the cached corpus (2023-12-20 → 2024-03-31):** 9,036 unique
+documents, 87.7/day, 8,186 comments and 850 stories, mean length 425 characters.
+
+### Scoring: VADER now, CryptoBERT optionally
+
+| Backend | Setup | Notes |
+|---|---|---|
+| `vader` (default) | none — already installed | VADER compound score, plus a fixed 42-term crypto lexicon |
+| `cryptobert` | `pip install transformers torch` **+ model files** | `ElKulako/cryptobert`, RoBERTa fine-tuned on crypto social posts |
+
+> **CryptoBERT cannot be fetched on the development network.** Measured
+> 2026-09-11: `huggingface.co` returns HTTP 403 from Cato with
+> `error: "Corporate Internet policy violation", categories: "… Generative AI
+> Tools"`, and `cdn-lfs.huggingface.co` does not resolve. `transformers` and
+> `torch` install normally — only the weights are unreachable. To use it,
+> either have `huggingface.co` allowlisted, or copy the model directory in by
+> hand and set `CRYPTOBERT_MODEL_PATH` to it. The fallback to VADER is loud.
+
+VADER is a 2014 general-purpose lexicon that cannot read crypto register —
+`rekt`, `hodl`, `rug pull`, `diamond hands` are all invisible to it. The
+included lexicon patch fixes the worst of that and is fixed rather than tuned
+against returns. CryptoBERT is the proper fix, and running both gives a free
+ablation row. **An unavailable CryptoBERT falls back to VADER with a warning,
+never silently** — a run scored by a different model is a different experiment.
+
+### Point-in-time discipline
+
+The bar whose **open** time is `t` averages documents created in
+`[t - lag - window, t - lag)`. Nothing published at or after the cutoff can
+reach the bar. Because Hacker News yields only tens of documents a day, readings
+aggregate over a trailing window (default 24h) rather than per bar, and a window
+holding fewer than `TEXT_SENTIMENT_MIN_DOCS` documents reports *no reading*
+instead of acting on noise.
+
+The score is the **causal z-score** of the window mean against its own trailing
+baseline, not the raw mean. General text carries a persistent positive drift
+(the measured corpus mean is `+0.176`); the z-score removes it and makes this
+comparable with the positioning score.
+
+### Configuration
+
+```bash
+USE_TEXT_SENTIMENT=true          # false = text-sentiment-off ablation arm
+TEXT_SENTIMENT_SCORER=vader      # or cryptobert
+TEXT_SENTIMENT_QUERIES=bitcoin,crypto
+TEXT_SENTIMENT_MAX_POINTS=1      # half the positioning cap; see below
+TEXT_SENTIMENT_LAG_BARS=1
+TEXT_SENTIMENT_WINDOW_HOURS=24
+TEXT_SENTIMENT_ZSCORE_WINDOW=168
+TEXT_SENTIMENT_MIN_DOCS=5        # below this, report "no reading"
+TEXT_SENTIMENT_AUTO_FETCH=true   # false = frozen offline run
+```
+
+`btc` is deliberately **not** a default query: it matched 1,185 documents in a
+single day during probing, i.e. it matches substrings and unrelated tokens
+rather than the asset.
+
+`TEXT_SENTIMENT_MAX_POINTS` defaults to **1, half the positioning cap**. This is
+a stated prior, not a fitted parameter: text sentiment is a single noisy feature
+that crosses its 1-sigma threshold on ~36% of bars, whereas positioning averages
+three features that often disagree and fires on ~15%. Giving the noisier channel
+equal weight would let it dominate the technical rule engine.
+
+### Measured behaviour (BTC, 2024-01-05 → 2024-03-25, 1,944 hourly bars)
+
+```
+7,946 documents; usable on 100.0% of bars (vader, 24h window, lag 1 bar)
+median 72 documents per bar
+706 bars would add points  (324 bullish / 382 bearish)
+```
+
+Like positioning, it enters the **rule engine** as well as the LLM prompt, so
+it is identifiable in the `USE_LLM_DECISIONS=false` arm. Every run reports
+`text_sentiment_report`.
+
+### CLI
+
+```bash
+python -m signals.text_sentiment probe --query bitcoin --date 2024-01-15
+python -m signals.text_sentiment fetch --start 2024-01-01 --end 2024-03-31
+python -m signals.text_sentiment report --scorer vader
+```
+
+## 📁 Project Structure
+
+```
+core/                    production logic, imports NO Streamlit
+  config.py              every runtime flag + domain types, one place
+  llm.py                 provider setup + the structured LLM contract
+  data.py                market data + technical indicators
+  execution.py           fill pricing, fees, slippage
+signals/                 exogenous data sources, independent of core
+  binance_positioning.py futures positioning (free, keyless)
+  text_sentiment.py      Hacker News text sentiment (free, keyless)
+  corporate_ca.py        CA bundle builder for TLS-inspecting proxies
+experiments/
+  harness.py             headless app loader + Streamlit stub
+  run_ablation.py        factorial ablation runner, one JSONL row per arm
+test/
+  golden_backtest.py     proves a refactor changed no numbers
+auto-trade.py            agents, the simulation loop and the Streamlit UI
+```
+
+The layering is strictly one-directional: `core` → nothing in-project,
+`signals` → nothing in-project, `auto-trade.py` → both.
+
+**`core` imports no Streamlit.** That single property is what makes a headless
+run possible, which the ablation table needs. Provider errors still reach the
+user: `core.llm.set_error_reporter(st.error)` is injected by the app at startup,
+so the red banners appear in the UI while a CLI run gets the message in the log.
+
+### Verifying a change moved no numbers
+
+```bash
+python test/golden_backtest.py --save    # before
+python test/golden_backtest.py --check   # after
+```
+
+A deterministic rules-only backtest over a fixed cached window, fingerprinted
+down to individual trade prices. `--check` prints a field-by-field diff and
+exits non-zero if anything moved. It runs in ~50 seconds because the three
+LLM-backed support agents are stubbed; see the caveat below for why that is
+necessary rather than merely convenient.
+
+### Running the ablation
+
+```bash
+python -m experiments.run_ablation --arms rules_only,pos_only,text_only,pos_text
+```
+
+Each arm runs in a **fresh subprocess** with its own environment, because the
+feature flags are read at import time by `core.config` and cannot be changed by
+mutating a module attribute afterwards. That also guarantees no state leaks
+between arms (cached LLM clients, agent instances, warmed z-scores).
+
+`USE_LLM_DECISIONS=false` gates **all four** model-backed agents — decision,
+market, pattern and risk — so an `llm=false` arm makes zero model calls, needs
+no API key, runs in seconds and is bit-reproducible. `--stub-support-agents` is
+now only meaningful for `llm=true` arms, where it pins the narrator agents so
+the measured effect is the *decision* agent's alone.
+
+> ### ⚠️ Any ablation table produced before 2026-09-11 is contaminated
+>
+> Until then the flag gated only `TradingDecisionAgent`, and the risk agent's
+> output was not inert: `risk_level` drives a confidence multiplier
+> (`{"low": 1.2, "high": 0.8}`) applied to
+> `min(0.9, 0.6 + net_signal * 0.1)`. At `net_signal = 2` that is `0.80`, so a
+> `"high"` reading gives `0.64` — just below the `0.65` moderate-mode gate —
+> turning a **BUY into a HOLD**. A single LLM word could flip a trade inside
+> the arm that was meant to contain no LLM.
+>
+> Verified after the fix: the golden harness now runs the **real, unstubbed**
+> path and still reports `GOLDEN MATCH`, and the four model-free arms reproduce
+> their previously stubbed numbers exactly — including with the Azure
+> credentials blanked. Regression suite: `python test/test_llm_gating.py`.
 
 ## 🏗 Architecture Overview
 
 ### Multi-Agent System Design
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    AI Trading System Architecture                    │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐  │
-│  │   Technical     │  │   Sentiment     │  │    Trading          │  │
-│  │   Analysis      │  │   Analysis      │  │    Decision         │  │
-│  │   Agent         │  │   Agent         │  │    Agent            │  │
-│  │   (Local)       │  │   (Local)       │  │    (OpenAI)         │  │
-│  └─────────────────┘  └─────────────────┘  └─────────────────────┘  │
-│           │                     │                     │              │
-│           └─────────────────────┼─────────────────────┘              │
-│                                 │                                    │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │              Streamlit Web Interface                            │ │
-│  │  • Real-time Charts    • Trade History    • Performance       │ │
-│  │  • Sentiment Display   • P&L Analysis     • Agent Reasoning   │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐ │
-│  │                     Data Layer                                  │ │
-│  │  • CCXT (Market Data)  • PostgreSQL (Storage)  • FAISS (ML)   │ │
-│  └─────────────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                     AMAAI Trading System Architecture                │
+├──────────────────────────────────────────────────────────────────────┤
+│  SIGNAL SOURCES (all point-in-time, all lagged and z-scored)         │
+│  ┌───────────────┐  ┌───────────────┐  ┌────────────────────────┐    │
+│  │  Technical    │  │ Text          │  │ Futures Positioning    │    │
+│  │  Indicators   │  │ Sentiment     │  │ (Binance USD-M)        │    │
+│  │  (from price) │  │ (Hacker News) │  │ crowd / top / taker    │    │
+│  │               │  │ VADER|CryptoBERT│ │ ~1 day publish lag    │    │
+│  └───────┬───────┘  └───────┬───────┘  └───────────┬────────────┘    │
+│          │                  │                      │                 │
+│          └──────────────────┼──────────────────────┘                 │
+│                             ▼                                        │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  RULE ENGINE  →  net_signal (integer, auditable)               │  │
+│  └────────────────────────────┬───────────────────────────────────┘  │
+│                               ▼                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │  TradingDecisionAgent (LLM)                                    │  │
+│  │  returns a CLAMPED integer adjustment + optional risk veto,    │  │
+│  │  so the model's contribution is measured, not assumed.         │  │
+│  │  USE_LLM_DECISIONS=false skips it -> rules-only baseline       │  │
+│  └────────────────────────────┬───────────────────────────────────┘  │
+│                               ▼                                      │
+│  EXECUTION: fill at NEXT bar's open + slippage (never this close)    │
+├──────────────────────────────────────────────────────────────────────┤
+│  Support agents (Market / Pattern / Risk) also call the LLM, and are │
+│  gated by the SAME flag, so llm=false makes zero model calls.        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Key Components
+### Code layout
 
-1. **Technical Analysis Agent** 🔍
-   - RSI, MACD, Bollinger Bands calculation
-   - Moving averages and trend analysis
+| Path | Imports Streamlit? | Contents |
+|---|---|---|
+| `core/` | **no** | `config` (every flag + domain type), `llm`, `data`, `execution` |
+| `signals/` | **no** | `binance_positioning`, `text_sentiment`, `corporate_ca` |
+| `experiments/` | no | `harness` (headless scaffolding), `run_ablation` |
+| `test/` | no | `golden_backtest` + unit suites |
+| `auto-trade.py` | yes | agents, simulation loop, Streamlit UI |
+
+`core` and `signals` importing no Streamlit is what makes headless, scripted
+runs possible; it is asserted by the ablation harness rather than trusted.
+
 ## 📱 Usage Guide
 
 ### Starting a Trading Simulation
@@ -145,7 +477,7 @@ python test/test_runner.py
    - Set initial capital (default: $10,000)
    - Choose time period for backtesting
    - Select cryptocurrency pair (e.g., BTC/USDT)
-   - Configure trading fees
+   - Fees and slippage come from `.env`, not the sidebar
 
 2. **Run Simulation**
    - Click "Start Trading Simulation"
@@ -156,7 +488,7 @@ python test/test_runner.py
 3. **Analyze Results**
    - Review trade history with P&L analysis
    - Compare performance vs buy-and-hold
-   - Examine sentiment correlation with trades
+   - Examine per-channel attribution (which signals moved which decisions)
    - Export results for further analysis
 
 ### Key Interface Features
@@ -164,9 +496,13 @@ python test/test_runner.py
 #### 🔮 **Next Action Recommendation**
 - **Multi-agent voting system** for trading decisions
 - **Technical Analysis Agent**: RSI, MACD, moving averages
-- **Sentiment Analysis Agent**: Social media sentiment scoring
+- **Text Sentiment Agent**: Hacker News score, document count, and the exact rule points it contributed
+- **Futures Positioning Agent**: per-feature z-scores against each feature's own trailing baseline
 - **Risk Management Agent**: Position sizing and risk assessment
 - **Final recommendation** with confidence scores
+
+Each agent panel states whether it had a usable reading, and an unavailable
+channel contributes nothing rather than being counted as a neutral vote.
 
 #### 📊 **Technical Analysis Dashboard**
 - **Professional TradingView-style charts**
@@ -174,11 +510,15 @@ python test/test_runner.py
 - **Technical indicators**: Bollinger Bands, RSI, MACD
 - **Buy/sell signals** overlaid on price charts
 
-#### 🎭 **Sentiment Analysis**
-- **Real-time social media monitoring**
-- **Influential account tracking** (Elon Musk, Donald Trump, etc.)
-- **Sentiment scoring** and market impact assessment
-- **Correlation with trading decisions**
+#### 💬 **Text Sentiment**
+- **Real posts and comments** from Hacker News via the keyless Algolia API
+- **VADER + 42-term crypto lexicon**, or CryptoBERT when `TEXT_SENTIMENT_SCORER=cryptobert`
+- **Causal z-scores** over a half-open `[cutoff - window, cutoff)` interval
+- **Byte-reproducible cache** with a `manifest.jsonl` recording URL, pull time, sha256 and document counts
+
+> Futures positioning is published by Binance as one file per **completed**
+> day, so the most recent 24-48 hours are normally absent. That channel can
+> inform a backtest but never a live next-bar decision.
 
 #### 📈 **Performance Analytics**
 - **Portfolio value tracking** over time
@@ -190,14 +530,23 @@ python test/test_runner.py
 
 ### Trading Parameters
 
-```python
-# In the Streamlit interface, configure:
-INITIAL_CAPITAL = 10000      # Starting portfolio value
-BUY_FEE_PCT = 0.1           # Buy transaction fee (0.1%)
-SELL_FEE_PCT = 0.1          # Sell transaction fee (0.1%)
-MAX_POSITION_SIZE = 0.3     # Maximum 30% of portfolio per trade
-STOP_LOSS_PCT = 0.05        # 5% stop-loss threshold
+```bash
+# Set in .env (capital and position sizing are also on the Streamlit sidebar)
+INITIAL_CAPITAL=10000     # Starting portfolio value
+BUY_FEE_PCT=0.1           # Buy fee, percent per side
+SELL_FEE_PCT=0.1          # Sell fee, percent per side
+SLIPPAGE_PCT=0.05         # Slippage, percent per side, charged on top
+MAX_POSITION_SIZE=0.3     # Maximum 30% of portfolio per trade
+STOP_LOSS_PCT=0.05        # 5% stop-loss threshold
 ```
+
+> **Fees are charged on both sides.** Until 2026-09-11 `sell_fee_pct` defaulted
+> to `0.0` and neither fee variable was read from `.env` at all, so every
+> backtest paid to enter and exited free. On the golden window that was $127.88
+> of unmodelled cost against $281.11 of reported profit — the reported return
+> fell from **2.81% to 1.53%** once it was fixed. Any figure produced by this
+> repository before that date is inflated by roughly that much.
+> Regression suite: `python test/test_execution_fees.py`.
 
 ### Environment Variables
 
@@ -243,7 +592,7 @@ python test/test_runner.py
 - ✅ Package imports and dependencies
 - ✅ Main module and agent initialization  
 - ✅ Data fetching and technical analysis
-- ✅ Sentiment analysis functionality
+- ✅ Text sentiment scoring (direction, not just "returns a dict")
 - ✅ Trading simulation logic
 - ✅ P&L calculation accuracy
 - ✅ Display functions and UI components
@@ -264,7 +613,7 @@ The system tracks comprehensive performance metrics:
 - **Strategy vs Buy & Hold**: Performance comparison
 - **Risk Metrics**: Volatility and risk analysis
 - **Trade Distribution**: Win/loss breakdown
-- **Sentiment Correlation**: Impact of social media sentiment
+- **Channel Attribution**: How many decisions each exogenous channel moved, and how many the LLM changed
 
 ## 🚀 Deployment
 
@@ -461,8 +810,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ```python
 config = TradingConfig(
     initial_capital=1000.0,      # Starting capital
-    buy_fee_pct=0.10,            # 10% fee on purchases
-    sell_fee_pct=0.0,            # No fee on sales
+    buy_fee_pct=0.10,            # 0.1% fee per buy (percent, not fraction)
+    sell_fee_pct=0.10,           # 0.1% fee per sell — symmetric
     enable_deep_learning=True,    # Enable ML predictions
     enable_vector_db=True,        # Enable pattern storage
     show_reasoning=True           # Show agent reasoning panel
