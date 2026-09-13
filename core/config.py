@@ -395,6 +395,10 @@ def describe_configuration() -> dict:
             "use_llm_decisions": USE_LLM_DECISIONS,
             "llm_max_adjustment": LLM_MAX_ADJUSTMENT,
             "llm_temperature": LLM_TEMPERATURE,
+            # Read from the environment rather than imported: core.config must
+            # not import core.llm (llm depends on config, not the reverse).
+            "llm_prompt_stance": os.getenv("LLM_PROMPT_STANCE",
+                                           "conservative").strip().lower(),
         },
         "phase2": {
             "allow_synthetic_data": ALLOW_SYNTHETIC_DATA,

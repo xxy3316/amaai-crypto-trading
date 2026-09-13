@@ -137,7 +137,7 @@ def _run_one_arm(args) -> dict:
 # ── the parent process: fan out over arms ───────────────────────────────────
 
 def _child_env(positioning: bool, text: bool, llm: bool,
-               stub_support: bool) -> dict:
+               stub_support: bool, prompt_stance: str = None) -> dict:
     env = dict(os.environ)
     env.update({
         "USE_POSITIONING_SIGNAL": "true" if positioning else "false",
@@ -150,6 +150,10 @@ def _child_env(positioning: bool, text: bool, llm: bool,
         "ABLATION_STUB_SUPPORT_AGENTS": "1" if stub_support else "0",
         "PYTHONIOENCODING": "utf-8",
     })
+    if llm and prompt_stance:
+        # Read at import time by core.llm, so it must be in the child's
+        # environment rather than set after the module is loaded.
+        env["LLM_PROMPT_STANCE"] = prompt_stance
     return env
 
 
@@ -166,6 +170,15 @@ def main() -> int:
                              "(default: rules_only, the model-free control)")
     parser.add_argument("--alpha", type=float, default=0.05,
                         help="familywise error rate for the Holm correction")
+    parser.add_argument("--prompt-stances", default="conservative",
+                        help="comma-separated prompt stances to run the LLM "
+                             "arms under: conservative, neutral, assertive. "
+                             "Each LLM arm is run once per stance and appears "
+                             "as arm@stance; non-LLM arms are unaffected and "
+                             "run once. Measured to swing the intervention "
+                             "rate from 0/15 to 12/15 on identical decisions, "
+                             "so it is an experimental variable, not a tuning "
+                             "knob -- fix the set in advance and report all.")
     parser.add_argument("--window-days", type=int, default=None,
                         help="walk-forward: cut windows of this many days out "
                              "of the cached coverage instead of using "
@@ -217,6 +230,16 @@ def main() -> int:
     if unknown:
         parser.error(f"unknown arm(s): {unknown}. Available: {list(ARMS)}")
 
+    from core.llm import PROMPT_STANCES
+    args.prompt_stances = [s.strip().lower()
+                           for s in args.prompt_stances.split(",") if s.strip()]
+    bad = [s for s in args.prompt_stances if s not in PROMPT_STANCES]
+    if bad:
+        # Rejected rather than defaulted: silently falling back would put a
+        # differently-prompted run in the results file under the wrong label.
+        parser.error(f"unknown prompt stance(s): {bad}. "
+                     f"Available: {list(PROMPT_STANCES)}")
+
     out_path = Path(args.out) if args.out else (
         REPO / "experiments" / "results" /
         f"ablation-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}.jsonl")
@@ -244,12 +267,29 @@ def main() -> int:
 
     rows, failures = [], 0
     wnames = _window_names(plan)
-    combos = list(itertools.product(range(len(plan)), names, range(args.repeats)))
-    for index, (widx, name, repeat) in enumerate(combos, start=1):
+    # The prompt stance only exists for arms that call the model, so a non-LLM
+    # arm is run ONCE rather than once per stance. Duplicating it would burn
+    # wall-clock on identical results and, worse, would put several copies of
+    # the same baseline into the walk-forward grid, where they would be
+    # averaged as if they were repeated measurements.
+    combos = []
+    for widx in range(len(plan)):
+        for name in names:
+            stances = args.prompt_stances if ARMS[name][2] else [None]
+            for stance in stances:
+                for repeat in range(args.repeats):
+                    combos.append((widx, name, stance, repeat))
+
+    total = len(combos)
+    for index, (widx, name, stance, repeat) in enumerate(combos, start=1):
         positioning, text, llm = ARMS[name]
         win_start, win_end, win_block = plan[widx]
         wname = wnames[widx]
-        label = f"[{index}/{total}] {wname} {name}" + (
+        # The stance is part of the arm's identity: `all_on` under two
+        # different prompts is two different treatments, and the analysis must
+        # not pool them.
+        arm_label = f"{name}@{stance}" if stance else name
+        label = f"[{index}/{total}] {wname} {arm_label}" + (
             f" run {repeat + 1}" if args.repeats > 1 else "")
         print(f"{label} ... ", end="", flush=True)
 
@@ -260,7 +300,8 @@ def main() -> int:
                    "--capital", str(args.capital), "--strategy", args.strategy]
         completed = subprocess.run(
             command, cwd=str(REPO),
-            env=_child_env(positioning, text, llm, args.stub_support_agents),
+            env=_child_env(positioning, text, llm, args.stub_support_agents,
+                           prompt_stance=stance),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
 
@@ -277,7 +318,8 @@ def main() -> int:
             continue
 
         row = {
-            "arm": name, "repeat": repeat,
+            "arm": arm_label, "base_arm": name, "prompt_stance": stance,
+            "repeat": repeat,
             "positioning": positioning, "text": text, "llm": llm,
             "support_agents_stubbed": args.stub_support_agents,
             # Flat keys as well as the nested block: the walk-forward analysis

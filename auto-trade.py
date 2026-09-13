@@ -237,6 +237,8 @@ from core.llm import (  # noqa: E402
     describe_active_model,
     get_llm,
     get_llm_provider_status,
+    prompt_stance_text,
+    resolved_prompt_stance,
     set_error_reporter,
 )
 
@@ -2390,11 +2392,7 @@ SIMILAR HISTORICAL PATTERNS: {vec_line}
 YOUR TASK
 Return a bounded adjustment to the net signal score of {sig['net_signal']}.
 - signal_adjustment must be an integer in [-{LLM_MAX_ADJUSTMENT}, +{LLM_MAX_ADJUSTMENT}].
-- Use 0 when the agent inputs add nothing beyond what the rules already capture.
-- Set veto=true ONLY to block a trade on clear risk grounds.
-- Every entry in key_factors must cite a specific input above, not generic advice.
-Be conservative: the rules are a reasonable baseline, so only move the score when
-the qualitative agent inputs genuinely justify it."""
+{prompt_stance_text()}"""
 
     def _query_llm(self, prompt: str) -> tuple:
         """Return (LLMTradeAdjustment or None, error string, latency seconds)."""
@@ -3470,6 +3468,11 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
             # Naming a deployment that made zero calls would misdescribe the
             # run, and probing it costs a network round trip the rules-only arm
             # should not need.
+            # Which prompt variant produced this run. Measured to swing the
+            # LLM's intervention rate from 0/15 to 12/15 on identical
+            # decisions, so a reported number is not interpretable without it.
+            'llm_prompt_stance': (resolved_prompt_stance()
+                                  if USE_LLM_DECISIONS else None),
             'model': (describe_active_model() if USE_LLM_DECISIONS else {
                 "provider": "none",
                 "note": "rules-only arm (USE_LLM_DECISIONS=false): no model "

@@ -260,6 +260,81 @@ def describe_active_model() -> dict:
 
 # LLM_MAX_ADJUSTMENT is imported from core.config above.
 
+# ── PROMPT STANCE: how much latitude the arbiter is given ───────────────────
+# These are the closing instructions of the decision prompt, and they turned out
+# to be the single largest determinant of whether the LLM does anything at all.
+#
+# Measured on 15 identical decisions (same bars, same model, temperature 0, only
+# this text differing):
+#
+#   conservative : adjustments {0: 15}                 non-zero  0/15
+#   neutral      : adjustments {-1: 6, 0: 3, +1: 6}    non-zero 12/15
+#
+# Under `conservative` the model returned a bearish STANCE and an adjustment of
+# zero on the same decision -- it was forming a view and being told not to act
+# on it. That is obedience, not incapacity, and it means a null result for "the
+# LLM changed nothing" would really have been a result about this paragraph.
+#
+# They are therefore treated as an experimental variable rather than a setting
+# to tune: fix them in advance, run all three, report all three. Tuning this
+# text until the returns improve and reporting only the winner would make the
+# finding an artifact of the search.
+#
+# Quote these verbatim in the methods section. Do not edit them to improve a
+# result; add a new named stance instead, so the history stays legible.
+
+PROMPT_STANCE_CONSERVATIVE = """- Use 0 when the agent inputs add nothing beyond what the rules already capture.
+- Set veto=true ONLY to block a trade on clear risk grounds.
+- Every entry in key_factors must cite a specific input above, not generic advice.
+Be conservative: the rules are a reasonable baseline, so only move the score when
+the qualitative agent inputs genuinely justify it."""
+
+PROMPT_STANCE_NEUTRAL = """- Move the score when the agent inputs above point somewhere the rules do not.
+- Set veto=true ONLY to block a trade on clear risk grounds.
+- Every entry in key_factors must cite a specific input above, not generic advice.
+The rules read price action only. The positioning and sentiment agents carry
+information the rules cannot see; weigh them on their merits and report the
+adjustment that follows from your reading."""
+
+PROMPT_STANCE_ASSERTIVE = """- Report the adjustment your reading of the inputs above supports.
+- Set veto=true ONLY to block a trade on clear risk grounds.
+- Every entry in key_factors must cite a specific input above, not generic advice.
+You are the arbiter, not a reviewer of the rule engine. The rules read price
+action only and are frequently wrong at turning points, which is where the
+positioning and sentiment agents are most informative. Use 0 only when the
+inputs genuinely balance."""
+
+PROMPT_STANCES = {
+    "conservative": PROMPT_STANCE_CONSERVATIVE,
+    "neutral": PROMPT_STANCE_NEUTRAL,
+    "assertive": PROMPT_STANCE_ASSERTIVE,
+}
+
+#: Default preserves the behaviour every result so far was produced under.
+LLM_PROMPT_STANCE = os.getenv("LLM_PROMPT_STANCE", "conservative").strip().lower()
+
+
+def prompt_stance_text(name: Optional[str] = None) -> str:
+    """Closing instruction for the decision prompt, by stance name.
+
+    An unknown name falls back to conservative WITH a warning rather than
+    raising: a typo in an env var should not take down a backtest, but it must
+    never silently change which variant a reported number came from.
+    """
+    key = (name or LLM_PROMPT_STANCE or "conservative").strip().lower()
+    if key not in PROMPT_STANCES:
+        logger.warning("Unknown LLM_PROMPT_STANCE %r; using 'conservative'. "
+                       "Valid: %s", key, ", ".join(PROMPT_STANCES))
+        key = "conservative"
+    return PROMPT_STANCES[key]
+
+
+def resolved_prompt_stance(name: Optional[str] = None) -> str:
+    """The stance name actually in force, for the run metadata."""
+    key = (name or LLM_PROMPT_STANCE or "conservative").strip().lower()
+    return key if key in PROMPT_STANCES else "conservative"
+
+
 class LLMTradeAdjustment(BaseModel):
     """Schema the decision LLM must fill in."""
     stance: str = Field(
