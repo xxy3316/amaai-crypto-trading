@@ -166,23 +166,21 @@ except ImportError:
     create_engine = None
     Engine = None
 
-# Deep Learning
-try:
-    import tensorflow as tf
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.model_selection import train_test_split
-    import joblib
-    ML_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"ML libraries not available: {e}")
-    ML_AVAILABLE = False
-    class StandardScaler:
-        def fit_transform(self, X): return X
-        def transform(self, X): return X
-    class train_test_split:
-        pass
-    tf = None
-    joblib = None
+# Deep learning was REMOVED on 2026-09-13, along with the TensorFlow, sklearn
+# and joblib imports that existed only to serve it.
+#
+# The `DeepLearningAgent` was never a working component. It had no training
+# code at all -- a function that BUILT an empty network, and nothing that ever
+# fitted one -- so `load_model()` always failed, `predict()` always
+# short-circuited, and the only thing it ever contributed was a fixed string in
+# the LLM prompt reading "signal n/a, confidence 0.00". It was excluded from
+# every experiment (see experiments/harness.py), so no reported number depended
+# on it, while the UI advertised "Deep Learning: Enabled" and promised neural
+# pattern recognition that did not exist.
+#
+# Nothing reusable was lost: a real deep-learning arm needs labels and
+# time-respecting train/validation splits, neither of which this design had,
+# so it would have to be written from scratch regardless.
 
 # Vector DB
 try:
@@ -2302,7 +2300,7 @@ class TradingDecisionAgent:
     def _build_llm_context(self, timestamp, sig: dict, current_price: float,
                            rule_action: TradingAction, market_analysis: str,
                            pattern_analysis: str, risk_assessment: dict,
-                           portfolio: dict, dl_prediction: dict,
+                           portfolio: dict,
                            vector_insights: dict, positioning=None,
                            text_sentiment=None) -> str:
         """Assemble every agent's output into one decision prompt."""
@@ -2339,11 +2337,6 @@ class TradingDecisionAgent:
             )
         elif positioning is not None:
             pos_line = f"not available ({positioning.reasoning})"
-
-        dl_line = "not available"
-        if dl_prediction:
-            dl_line = (f"signal {dl_prediction.get('signal', 'n/a')}, "
-                       f"confidence {dl_prediction.get('confidence', 0):.2f}")
 
         vec_line = "not available"
         if vector_insights:
@@ -2392,7 +2385,6 @@ FUTURES POSITIONING AGENT (Binance USD-M perpetuals, point-in-time)
 TEXT SENTIMENT AGENT (Hacker News posts and comments, point-in-time)
 - {text_line}
 
-DEEP LEARNING AGENT: {dl_line}
 SIMILAR HISTORICAL PATTERNS: {vec_line}
 
 YOUR TASK
@@ -2422,7 +2414,6 @@ the qualitative agent inputs genuinely justify it."""
 
     def make_decision(self, timestamp, market_analysis: str, pattern_analysis: str,
                       risk_assessment: dict, portfolio: dict, last_decision=None,
-                      dl_prediction: dict = None,
                       vector_insights: dict = None, positioning=None,
                       text_sentiment=None) -> TradingDecision:
         """Integrate all analyses and make a trading decision."""
@@ -2467,7 +2458,7 @@ the qualitative agent inputs genuinely justify it."""
             prompt = self._build_llm_context(
                 timestamp, sig, current_price, rule_action, market_analysis,
                 pattern_analysis, risk_assessment, portfolio,
-                dl_prediction, vector_insights, positioning,
+                vector_insights, positioning,
                 text_sentiment,
             )
             adjustment, error, latency = self._query_llm(prompt)
@@ -2539,191 +2530,6 @@ the qualitative agent inputs genuinely justify it."""
                 price=current_price,
                 timestamp=timestamp,
             )
-
-# ── DEEP LEARNING AGENT ────────────────────────────────────────────────────
-class DeepLearningAgent:
-    """Deep Learning agent for pattern recognition and prediction"""
-    
-    def __init__(self, config: TradingConfig):
-        self.config = config
-        self.model = None
-        self.scaler = StandardScaler()
-        self.is_trained = False
-        self.model_path = "dl_model.pkl"
-        self.scaler_path = "scaler.pkl"
-        
-    def prepare_features(self, df: pd.DataFrame, index: int, window: int = 20) -> np.ndarray:
-        """Prepare features for the model"""
-        if index < window:
-            return None
-        
-        # Extract features from the window
-        start_idx = index - window
-        features = []
-        
-        for i in range(start_idx, index):
-            if i < 0 or i >= len(df):
-                continue
-            
-            row = df.iloc[i]
-            features.extend([
-                float(row.close),
-                float(row.high),
-                float(row.low),
-                float(row.volume),
-                float(row.MA20),
-                float(row.RSI),
-                float(row.MACD_hist),
-                float(row.UpperBB),
-                float(row.LowerBB),
-                float(row.close / row.MA20),  # Price to MA ratio
-                float(row.volume / row.volume.rolling(10).mean()) if not pd.isna(row.volume.rolling(10).mean()) else 1.0
-            ])
-        
-        return np.array(features).reshape(1, -1)
-    
-    def create_model(self, input_shape: int) -> Union[Any, None]:
-        """Create the neural network model"""
-        if not ML_AVAILABLE or tf is None:
-            return None
-            
-        model = tf.keras.Sequential([
-            tf.keras.layers.Dense(128, activation='relu', input_shape=(input_shape,)),
-            tf.keras.layers.Dropout(0.3),
-            tf.keras.layers.Dense(64, activation='relu'),
-            tf.keras.layers.Dropout(0.3),
-            tf.keras.layers.Dense(32, activation='relu'),
-            tf.keras.layers.Dense(3, activation='softmax')  # BUY, SELL, HOLD
-        ])
-        
-        model.compile(
-            optimizer='adam',
-            loss='sparse_categorical_crossentropy',
-            metrics=['accuracy']
-        )
-        
-        return model
-    
-    def train(self, df: pd.DataFrame, decisions: List[TradingDecision]) -> bool:
-        """Train the deep learning model"""
-        try:
-            if not ML_AVAILABLE or tf is None:
-                logger.warning("ML libraries not available for training")
-                return False
-                
-            if len(decisions) < 100:  # Need minimum data for training
-                return False
-            
-            X, y = [], []
-            
-            for i, decision in enumerate(decisions):
-                if i < 20:  # Skip first 20 for feature window
-                    continue
-                    
-                features = self.prepare_features(df, i)
-                if features is not None:
-                    X.append(features.flatten())
-                    # Convert action to numeric
-                    if decision.action == TradingAction.BUY:
-                        y.append(0)
-                    elif decision.action == TradingAction.SELL:
-                        y.append(1)
-                    else:
-                        y.append(2)
-            
-            if len(X) < 50:
-                return False
-            
-            X = np.array(X)
-            y = np.array(y)
-            
-            # Scale features
-            X_scaled = self.scaler.fit_transform(X)
-            
-            # Split data
-            X_train, X_test, y_train, y_test = train_test_split(
-                X_scaled, y, test_size=0.2, random_state=42
-            )
-            
-            # Create and train model
-            self.model = self.create_model(X_train.shape[1])
-            if self.model is None:
-                return False
-            
-            # Train with early stopping
-            early_stopping = tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss', patience=10, restore_best_weights=True
-            )
-            
-            self.model.fit(
-                X_train, y_train,
-                epochs=100,
-                batch_size=32,
-                validation_split=0.2,
-                callbacks=[early_stopping],
-                verbose=0
-            )
-            
-            # Save model and scaler
-            if joblib:
-                self.model.save(self.model_path)
-                joblib.dump(self.scaler, self.scaler_path)
-            
-            self.is_trained = True
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error training deep learning model: {e}")
-            return False
-    
-    def predict(self, df: pd.DataFrame, index: int) -> Dict[str, Any]:
-        """Make prediction using the trained model"""
-        try:
-            if not self.is_trained or self.model is None:
-                return {"prediction": TradingAction.HOLD, "confidence": 0.0}
-            
-            features = self.prepare_features(df, index)
-            if features is None:
-                return {"prediction": TradingAction.HOLD, "confidence": 0.0}
-            
-            # Scale features
-            features_scaled = self.scaler.transform(features)
-            
-            # Make prediction
-            prediction = self.model.predict(features_scaled, verbose=0)
-            predicted_class = np.argmax(prediction[0])
-            confidence = float(np.max(prediction[0]))
-            
-            # Convert to action
-            actions = [TradingAction.BUY, TradingAction.SELL, TradingAction.HOLD]
-            predicted_action = actions[predicted_class]
-            
-            return {
-                "prediction": predicted_action,
-                "confidence": confidence,
-                "probabilities": {
-                    "BUY": float(prediction[0][0]),
-                    "SELL": float(prediction[0][1]),
-                    "HOLD": float(prediction[0][2])
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Error making prediction: {e}")
-            return {"prediction": TradingAction.HOLD, "confidence": 0.0}
-    
-    def load_model(self) -> bool:
-        """Load pre-trained model if available"""
-        try:
-            if os.path.exists(self.model_path) and os.path.exists(self.scaler_path):
-                self.model = tf.keras.models.load_model(self.model_path)
-                self.scaler = joblib.load(self.scaler_path)
-                self.is_trained = True
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"Error loading model: {e}")
-            return False
 
 # ── VECTOR DATABASE AGENT ──────────────────────────────────────────────────
 class VectorDBAgent:
@@ -3132,7 +2938,7 @@ def display_past_results():
 
 # ── MAIN SIMULATION FUNCTION ──────────────────────────────────────────────
 def run_trading_simulation(symbol_input, interval, start_date, end_date, initial_capital, 
-                          enable_deep_learning, enable_vector_db, show_reasoning, 
+                          enable_vector_db, show_reasoning, 
                           strategy_mode, custom_position_size, custom_confidence, custom_signal_threshold):
     """Main function to run the multi-agent trading simulation"""
     
@@ -3162,7 +2968,6 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
         config.min_confidence = custom_confidence
     if custom_signal_threshold is not None:
         config.signal_threshold = custom_signal_threshold
-    config.enable_deep_learning = enable_deep_learning
     config.enable_vector_db = enable_vector_db
     config.show_reasoning = show_reasoning
 
@@ -3218,13 +3023,8 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
         decision_agent = TradingDecisionAgent(df, config)
         
         # Optional agents
-        dl_agent = None
         vector_agent = None
-        
-        if config.enable_deep_learning and ML_AVAILABLE:
-            dl_agent = DeepLearningAgent(config)
-            dl_agent.load_model()
-        
+
         if config.enable_vector_db and VECTOR_DB_AVAILABLE:
             vector_agent = VectorDBAgent(config)
             vector_agent.initialize()
@@ -3451,12 +3251,7 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
                 if text_agent is not None:
                     text_reading = text_agent.reading_for(timestamp)
 
-                # Step 3e: Deep Learning Prediction
-                dl_prediction = None
-                if dl_agent and dl_agent.is_trained:
-                    dl_prediction = dl_agent.predict(df, current_idx)
-                
-                # Step 3f: Vector DB Insights
+                # Step 3e: Vector DB Insights
                 vector_insights = None
                 if vector_agent and vector_agent.initialized:
                     current_conditions = {
@@ -3475,7 +3270,6 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
                 decision = decision_agent.make_decision(
                     timestamp, market_analysis, pattern_analysis,
                     risk_assessment, portfolio, last_decision,
-                    dl_prediction=dl_prediction,
                     vector_insights=vector_insights,
                     positioning=positioning_reading,
                     text_sentiment=text_reading,
@@ -3516,7 +3310,6 @@ def run_trading_simulation(symbol_input, interval, start_date, end_date, initial
                                     if positioning_reading is not None else None),
                     'text_sentiment': (text_reading.to_dict()
                                        if text_reading is not None else None),
-                    'dl_prediction': dl_prediction,
                     'vector_insights': vector_insights,
                     # Phase 1 telemetry: what the LLM changed on this decision
                     'llm_contribution': decision.llm,
@@ -3917,18 +3710,26 @@ def main():
     
     # AI Configuration (collapsible)
     with st.sidebar.expander("🧠 AI Configuration", expanded=False):
-        enable_deep_learning = st.checkbox(
-            "Enable Deep Learning",
-            value=ML_AVAILABLE,
-            disabled=not ML_AVAILABLE,
-            help="Use neural networks for pattern recognition" if ML_AVAILABLE else "Install TensorFlow to enable"
-        )
-        
+        # Defaults to OFF, and says plainly what it does. It used to default ON
+        # with the help text "Use vector database for historical pattern
+        # matching", which oversold it: the store is built up during a single
+        # run and discarded at the end, so it recalls only trades from the run
+        # in progress and never anything from history. It also reaches the
+        # decision only as text inside the LLM prompt, so it does nothing at all
+        # in a rules-only run, and it has no telemetry -- unlike positioning and
+        # text sentiment, there is no measurement of whether it changed anything.
+        # Every ablation already runs with it off (experiments/harness.py), so
+        # no reported number depends on it.
         enable_vector_db = st.checkbox(
-            "Enable Vector Database",
-            value=VECTOR_DB_AVAILABLE,
+            "Enable Vector Database (experimental)",
+            value=False,
             disabled=not VECTOR_DB_AVAILABLE,
-            help="Use vector database for historical pattern matching" if VECTOR_DB_AVAILABLE else "Install FAISS to enable"
+            help=("Feeds the LLM a summary of earlier trades from THIS run that "
+                  "had similar conditions. The memory starts empty and is "
+                  "discarded when the run ends, so it is recall within a run, "
+                  "not learning across runs. Costs one embedding call per "
+                  "trade. Unmeasured: excluded from all experiments."
+                  if VECTOR_DB_AVAILABLE else "Install FAISS to enable")
         )
         
         show_reasoning = st.checkbox(
@@ -3957,7 +3758,6 @@ def main():
         
         # Feature availability
         st.markdown("**Available Features:**")
-        st.markdown(f"🧠 Deep Learning: {'✅' if ML_AVAILABLE else '❌'}")
         st.markdown(f"🗄️ Vector DB: {'✅' if VECTOR_DB_AVAILABLE else '❌'}")
         st.markdown(f"📊 Text Sentiment: {'✅' if TEXT_SENTIMENT_AVAILABLE else '❌'}")
     
@@ -4045,8 +3845,8 @@ def main():
         with strategy_info_col3:
             st.markdown(f"""
             **AI Features:**
-            - Deep Learning: {'Enabled' if enable_deep_learning else 'Disabled'}
-            - Vector DB: {'Enabled' if enable_vector_db else 'Disabled'}
+            - LLM decisions: {'On' if USE_LLM_DECISIONS else 'Off (rules-only arm)'}
+            - Vector DB: {'On (experimental)' if enable_vector_db else 'Off'}
             - Reasoning: {'Shown' if show_reasoning else 'Hidden'}
             """)
         
@@ -4100,7 +3900,7 @@ def main():
         st.info("🚀 Starting simulation...")
         try:
             run_trading_simulation(symbol_input, interval, start_date, end_date, initial_capital,
-                                 enable_deep_learning, enable_vector_db, show_reasoning,
+                                 enable_vector_db, show_reasoning,
                                  strategy_mode, custom_position_size, custom_confidence, custom_signal_threshold)
         except Exception as e:
             st.error(f"Simulation failed: {str(e)}")
@@ -4113,7 +3913,7 @@ def main():
         quick_end_date = datetime.now()
         try:
             run_trading_simulation(symbol_input, interval, quick_start_date, quick_end_date, initial_capital,
-                                 enable_deep_learning, enable_vector_db, show_reasoning,
+                                 enable_vector_db, show_reasoning,
                                  strategy_mode, custom_position_size, custom_confidence, custom_signal_threshold)
         except Exception as e:
             st.error(f"Quick test failed: {str(e)}")

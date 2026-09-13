@@ -137,7 +137,9 @@ class TradingConfig(BaseModel):
     # patches the module constant gets the patched value.
     buy_fee_pct: float = Field(default_factory=lambda: BUY_FEE_PCT)
     sell_fee_pct: float = Field(default_factory=lambda: SELL_FEE_PCT)
-    enable_deep_learning: bool = True
+    # `enable_deep_learning` was removed on 2026-09-13 along with the agent it
+    # gated. The agent had no training code, so it never produced a prediction;
+    # see the note at the top of auto-trade.py.
     enable_vector_db: bool = True
     show_reasoning: bool = True
     target_win_rate: float = 0.75

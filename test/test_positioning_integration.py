@@ -197,7 +197,7 @@ class TestDecisionAndPromptWiring(unittest.TestCase):
         prompt = self.agent._build_llm_context(
             self.timestamp, sig, 42000.0, APP.TradingAction.BUY,
             "market", "pattern", {"risk_level": "medium", "reasoning": "r"},
-            dict(self.portfolio), dl_prediction=None, vector_insights=None,
+            dict(self.portfolio), vector_insights=None,
             positioning=reading(+0.8, bull=2),
         )
         self.assertIn("FUTURES POSITIONING AGENT", prompt)
@@ -211,7 +211,7 @@ class TestDecisionAndPromptWiring(unittest.TestCase):
         prompt = self.agent._build_llm_context(
             self.timestamp, sig, 42000.0, APP.TradingAction.HOLD,
             "market", "pattern", {"risk_level": "medium", "reasoning": "r"},
-            dict(self.portfolio), dl_prediction=None, vector_insights=None,
+            dict(self.portfolio), vector_insights=None,
             positioning=None,
         )
         self.assertIn("FUTURES POSITIONING AGENT", prompt)
@@ -305,7 +305,7 @@ class TestTextSentimentWiring(unittest.TestCase):
         prompt = self.agent._build_llm_context(
             self.timestamp, sig, 42000.0, APP.TradingAction.BUY, "m", "p",
             {"risk_level": "medium", "reasoning": "r"}, dict(self.portfolio),
-            dl_prediction=None, vector_insights=None, positioning=None,
+            vector_insights=None, positioning=None,
             text_sentiment=text_reading(+0.8, bull=1),
         )
         self.assertIn("TEXT SENTIMENT AGENT", prompt)
@@ -323,7 +323,7 @@ class TestTextSentimentWiring(unittest.TestCase):
         prompt = self.agent._build_llm_context(
             self.timestamp, sig, 42000.0, APP.TradingAction.HOLD, "m", "p",
             {"risk_level": "medium", "reasoning": "r"}, dict(self.portfolio),
-            dl_prediction=None, vector_insights=None, positioning=None,
+            vector_insights=None, positioning=None,
             text_sentiment=None,
         )
         self.assertNotIn("LEGACY SENTIMENT", prompt)

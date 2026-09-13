@@ -139,14 +139,14 @@ def run_headless(
     interval: str = "1h",
     capital: float = 10000.0,
     strategy: str = "moderate",
-    enable_deep_learning: bool = False,
     enable_vector_db: bool = False,
 ) -> tuple:
     """Run one backtest and return (summary, elapsed_seconds).
 
-    The deep-learning and vector agents default off: the model is untrained and
-    the vector store starts empty here, so including them adds variance without
-    adding anything comparable between runs.
+    The vector agent defaults off: its store starts empty in every run and is
+    discarded at the end, so including it adds variance without adding anything
+    comparable between runs. (The deep-learning agent it used to sit beside was
+    removed entirely on 2026-09-13 -- it had no training code.)
 
     The UI and persistence tails are replaced, so only the numbers come back.
     """
@@ -165,7 +165,6 @@ def run_headless(
         start_date=pd.Timestamp(start),
         end_date=pd.Timestamp(end),
         initial_capital=capital,
-        enable_deep_learning=enable_deep_learning,
         enable_vector_db=enable_vector_db,
         show_reasoning=False,
         strategy_mode=strategy,
