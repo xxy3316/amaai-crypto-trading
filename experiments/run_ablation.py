@@ -170,7 +170,10 @@ def main() -> int:
                              "(default: rules_only, the model-free control)")
     parser.add_argument("--alpha", type=float, default=0.05,
                         help="familywise error rate for the Holm correction")
-    parser.add_argument("--prompt-stances", default="conservative",
+    # Defaults to the system's own stance, so a plain ablation run measures
+    # what the app actually does. Pass --prompt-stances conservative to
+    # reproduce any LLM number produced before 2026-09-13.
+    parser.add_argument("--prompt-stances", default="neutral",
                         help="comma-separated prompt stances to run the LLM "
                              "arms under: conservative, neutral, assertive. "
                              "Each LLM arm is run once per stance and appears "

@@ -64,9 +64,24 @@ class TestStanceRegistry(unittest.TestCase):
         """Changing this silently re-bases every number produced before today."""
         self.assertEqual(PROMPT_STANCE_CONSERVATIVE, HISTORICAL_TAIL)
 
-    def test_default_is_conservative(self):
-        """The default must preserve existing behaviour, not the new option."""
-        self.assertEqual(prompt_stance_text(), PROMPT_STANCE_CONSERVATIVE)
+    def test_default_is_neutral(self):
+        """Default changed conservative -> neutral on 2026-09-13.
+
+        On DESIGN grounds, not performance: under `conservative` the model
+        changed 1 decision in 265 (0.4%), which is an arbiter instructed into
+        irrelevance -- close to the decorative-LLM problem this project set out
+        to fix. Return differences between stances were not significant, so
+        performance must never be cited as the reason.
+
+        This test exists so the default cannot drift back silently: any change
+        here re-bases every LLM number the system produces.
+        """
+        self.assertEqual(resolved_prompt_stance(), "neutral")
+
+    def test_conservative_remains_reachable_for_reproduction(self):
+        """Every LLM number before 2026-09-13 came from this stance."""
+        self.assertEqual(prompt_stance_text("conservative"),
+                         PROMPT_STANCE_CONSERVATIVE)
 
     def test_the_variants_are_actually_different(self):
         texts = [PROMPT_STANCE_CONSERVATIVE, PROMPT_STANCE_NEUTRAL,
@@ -115,10 +130,22 @@ class TestStanceResolution(unittest.TestCase):
             with self.subTest(spelling=spelling):
                 self.assertEqual(resolved_prompt_stance(spelling), "neutral")
 
-    def test_empty_means_default(self):
+    def test_empty_means_the_configured_default(self):
+        """'Not specified' and 'specified but wrong' are different cases.
+
+        Nothing given falls through to the configured default, whatever that
+        currently is. A typo instead falls back to `conservative` -- the least
+        interventionist option -- because an unrecognised value means the
+        operator's intent is unknown, and the safe reading of unknown intent is
+        to leave the rule engine alone.
+        """
         for empty in (None, "", "   "):
             with self.subTest(value=empty):
-                self.assertEqual(resolved_prompt_stance(empty), "conservative")
+                self.assertEqual(resolved_prompt_stance(empty),
+                                 resolved_prompt_stance())
+
+    def test_typo_falls_back_to_the_least_interventionist_stance(self):
+        self.assertEqual(resolved_prompt_stance("nonsense"), "conservative")
 
 
 class TestStanceIsRecorded(unittest.TestCase):

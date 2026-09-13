@@ -310,8 +310,33 @@ PROMPT_STANCES = {
     "assertive": PROMPT_STANCE_ASSERTIVE,
 }
 
-#: Default preserves the behaviour every result so far was produced under.
-LLM_PROMPT_STANCE = os.getenv("LLM_PROMPT_STANCE", "conservative").strip().lower()
+#: Default changed conservative -> neutral on 2026-09-13, on DESIGN grounds and
+#: explicitly NOT on performance grounds.
+#:
+#: Measured over 5 windows x 265 decisions per arm:
+#:
+#:     conservative :   1/265 decisions changed (0.4%),  mean return +0.20%
+#:     neutral      :  30/265 decisions changed (11.3%), mean return +0.83%
+#:     assertive    :  27/265 decisions changed (10.2%), mean return -0.33%
+#:
+#: The return differences are NOT significant -- every walk-forward interval
+#: spans zero (neutral vs rules_only: [-4.75, +2.44], p_adj 0.895). Choosing
+#: neutral because it scored highest would be selecting the variant that won on
+#: five noisy windows, which is the error this whole dimension exists to avoid.
+#:
+#: The reason is structural instead. This project began from an audit finding
+#: that the LLM had no causal effect on trades. Under `conservative` the model
+#: intervenes on 1 decision in 265 -- wired correctly, but instructed into
+#: irrelevance, which lands back near the original problem. An arbiter that
+#: defers 99.6% of the time does not support a claim about LLM-driven decisions.
+#: `neutral` restores a functioning component while staying modest: it returns
+#: only +/-1, never the +/-2 or +/-3 it is permitted.
+#:
+#: Two consequences worth remembering. Every LLM number produced before this
+#: date came from `conservative`, so those are the conservative ARM, not "the
+#: system". And neutral trades noticeably less: 8.0 trades per window against
+#: the rule engine's 12.8.
+LLM_PROMPT_STANCE = os.getenv("LLM_PROMPT_STANCE", "neutral").strip().lower()
 
 
 def prompt_stance_text(name: Optional[str] = None) -> str:
@@ -321,7 +346,7 @@ def prompt_stance_text(name: Optional[str] = None) -> str:
     raising: a typo in an env var should not take down a backtest, but it must
     never silently change which variant a reported number came from.
     """
-    key = (name or LLM_PROMPT_STANCE or "conservative").strip().lower()
+    key = _stance_key(name)
     if key not in PROMPT_STANCES:
         logger.warning("Unknown LLM_PROMPT_STANCE %r; using 'conservative'. "
                        "Valid: %s", key, ", ".join(PROMPT_STANCES))
@@ -329,9 +354,20 @@ def prompt_stance_text(name: Optional[str] = None) -> str:
     return PROMPT_STANCES[key]
 
 
+def _stance_key(name: Optional[str] = None) -> str:
+    """Normalise a requested stance, distinguishing absent from misspelled.
+
+    Stripping BEFORE the emptiness test matters: a whitespace-only value means
+    "not specified" and must fall through to the configured default, not be
+    treated as an unrecognised name and silently forced to conservative.
+    """
+    key = (name or "").strip().lower()
+    return key or LLM_PROMPT_STANCE or "conservative"
+
+
 def resolved_prompt_stance(name: Optional[str] = None) -> str:
     """The stance name actually in force, for the run metadata."""
-    key = (name or LLM_PROMPT_STANCE or "conservative").strip().lower()
+    key = _stance_key(name)
     return key if key in PROMPT_STANCES else "conservative"
 
 
