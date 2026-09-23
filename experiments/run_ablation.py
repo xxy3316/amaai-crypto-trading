@@ -137,7 +137,8 @@ def _run_one_arm(args) -> dict:
 # ── the parent process: fan out over arms ───────────────────────────────────
 
 def _child_env(positioning: bool, text: bool, llm: bool,
-               stub_support: bool, prompt_stance: str = None) -> dict:
+               stub_support: bool, prompt_stance: str = None,
+               run_tag: str = None) -> dict:
     env = dict(os.environ)
     env.update({
         "USE_POSITIONING_SIGNAL": "true" if positioning else "false",
@@ -154,6 +155,11 @@ def _child_env(positioning: bool, text: bool, llm: bool,
         # Read at import time by core.llm, so it must be in the child's
         # environment rather than set after the module is loaded.
         env["LLM_PROMPT_STANCE"] = prompt_stance
+    if run_tag:
+        # Every arm appends to one DECISION_LOG_PATH, so each record needs to
+        # say which run produced it. Without this the file is interleaved and
+        # any per-arm statistic computed from it is silently pooled.
+        env["DECISION_LOG_RUN"] = run_tag
     return env
 
 
@@ -304,7 +310,8 @@ def main() -> int:
         completed = subprocess.run(
             command, cwd=str(REPO),
             env=_child_env(positioning, text, llm, args.stub_support_agents,
-                           prompt_stance=stance),
+                           prompt_stance=stance,
+                           run_tag=f"{wname}/{arm_label}"),
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
 

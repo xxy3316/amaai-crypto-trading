@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 #: Set to a file path to switch logging on. Absent means no logging at all.
 DECISION_LOG_PATH_ENV = "DECISION_LOG_PATH"
 
+#: A label stamped on every record, so runs that share one log file can be told
+#: apart afterwards. The ablation sets it to "<window>/<arm>"; without it, a
+#: multi-arm run produces one interleaved file with no way to separate the arms,
+#: and every per-arm statistic computed from it is silently pooled.
+DECISION_LOG_RUN_ENV = "DECISION_LOG_RUN"
+
 #: Prompts are ~1.5k tokens each and repeat a large fixed scaffold. Storing the
 #: full text every time makes the file mostly duplicate. The full text is kept
 #: for the FIRST occurrence of each distinct prompt and a hash thereafter, so
@@ -83,6 +89,7 @@ class DecisionLogger:
         raw = path if path is not None else os.getenv(DECISION_LOG_PATH_ENV, "")
         self.path = Path(raw).expanduser() if raw else None
         self.enabled = self.path is not None
+        self.run_tag = os.getenv(DECISION_LOG_RUN_ENV, "") or None
         self.written = 0
         self.failures = 0
         if self.enabled:
@@ -112,6 +119,8 @@ class DecisionLogger:
                     # Reconstructible from the first occurrence of this hash.
                     record["prompt"] = None
                     record["prompt_elided"] = True
+            if self.run_tag:
+                record.setdefault("run", self.run_tag)
             record.setdefault("logged_at_utc",
                               dt.datetime.now(dt.timezone.utc).isoformat())
             line = json.dumps(record, default=str, sort_keys=True)
