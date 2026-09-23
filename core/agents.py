@@ -40,6 +40,7 @@ from core.config import (
     TradingDecision,
 )
 from core.data import resolve_bar_index
+from core.decision_log import get_decision_logger, rule_features
 from core.llm import (
     AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_API_VERSION,
@@ -51,6 +52,7 @@ from core.llm import (
     LLMTradeAdjustment,
     get_llm,
     prompt_stance_text,
+    resolved_prompt_stance,
 )
 
 logger = logging.getLogger(__name__)
@@ -898,6 +900,35 @@ Return a bounded adjustment to the net signal score of {sig['net_signal']}.
             final_conf = min(0.95, 0.7 * final_conf + 0.3 * contrib.confidence)
 
             contrib.final_action = final_action.value
+
+            # Observation only: what was asked, what came back, and the inputs
+            # that were on the table. Inert unless DECISION_LOG_PATH is set, and
+            # it cannot raise into this function -- a logging failure must never
+            # change a trade.
+            get_decision_logger().log(
+                timestamp=timestamp,
+                price=current_price,
+                prompt=prompt,
+                raw_adjustment=raw_adj,
+                adjustment=clamped,
+                clamped=(raw_adj != clamped),
+                stance=contrib.stance,
+                veto=contrib.veto,
+                llm_confidence=contrib.confidence,
+                key_factors=contrib.key_factors,
+                rationale=contrib.rationale,
+                rule_action=rule_action.value,
+                final_action=final_action.value,
+                changed_decision=contrib.changed_decision,
+                adjusted_signal=adjusted_signal,
+                final_confidence=final_conf,
+                latency_s=latency,
+                prompt_stance=resolved_prompt_stance(),
+                holding=bool(portfolio.get("holding")),
+                positioning=positioning,
+                text_sentiment=text_sentiment,
+                **rule_features(sig),
+            )
             if contrib.changed_decision:
                 self.stats["changed"] += 1
 
